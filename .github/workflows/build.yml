@@ -1,18 +1,20 @@
-name: Build ReviewCrawler EXE
+name: Build and Auto Update Release
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main ] # main 브랜치에 코드가 올라올 때마다 실행
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
-    
+    permissions:
+      contents: write # Release에 파일을 쓸 권한 설정
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -23,15 +25,21 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-    
+        pip install pyinstaller
+
     - name: Build EXE
       run: |
-        # --name "ReviewCrawler"는 결과물 EXE 파일의 이름입니다.
-        # 마지막의 review_crawler.py는 실제 소스 파일명입니다.
+        # 파일명을 실제 파일인 review_crawler.py로 설정
         pyinstaller --onefile --windowed --clean --name "ReviewCrawler" review_crawler.py
-    
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
+
+    - name: Update Latest Release
+      uses: softprops/action-gh-release@v2
       with:
-        name: ReviewCrawler-EXE-Package
-        path: dist/ReviewCrawler.exe
+        tag_name: "latest" # 항상 'latest'라는 태그 이름으로 관리
+        name: "최신 버전 (자동 업데이트)"
+        body: "코드가 변경될 때마다 자동으로 빌드된 최신 버전입니다."
+        draft: false
+        prerelease: false
+        files: dist/ReviewCrawler.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
