@@ -83,10 +83,3 @@ python review_crawler.py
 1. 반드시 **크롬 디버깅 모드**를 먼저 실행한 후 프로그램 내 [🔌 크롬 연결] 버튼을 눌러야 합니다.
 2. 각 에이전시(KLOOK, KKDAY, GYG) 사이트에 미리 **로그인**이 되어 있어야 크롤링이 가능합니다.
 3. 엑셀 파일이 열려 있는 상태에서는 저장이 실패할 수 있으니 파일을 닫고 실행해 주세요.
-
----
-
-## 🛠 기술 스택
-- **Language**: Python 3.8+
-- **Library**: Selenium, Pandas, Tkinter, Openpyxl
-- **Automation**: Chrome DevTools Protocol (9222 Port)
