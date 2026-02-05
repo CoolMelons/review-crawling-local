@@ -2,14 +2,14 @@ name: Build and Auto Update Release
 
 on:
   push:
-    branches: [ main ] # main 브랜치에 코드가 올라올 때마다 실행
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: write # Release에 파일을 쓸 권한 설정
+      contents: write # Release 수정 권한
 
     steps:
     - name: Checkout code
@@ -35,11 +35,14 @@ jobs:
     - name: Update Latest Release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: "latest" # 항상 'latest'라는 태그 이름으로 관리
-        name: "최신 버전 (자동 업데이트)"
-        body: "코드가 변경될 때마다 자동으로 빌드된 최신 버전입니다."
+        tag_name: "latest"
+        name: "ReviewCrawler 최신 버전 (자동 빌드)" # 요청하신 제목으로 수정
+        body: |
+          본 파일은 최신 소스 코드가 push 될 때마다 자동으로 업데이트됩니다.
+          마지막 업데이트 일시: ${{ github.event.head_commit.timestamp }}
         draft: false
         prerelease: false
         files: dist/ReviewCrawler.exe
+        make_latest: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
