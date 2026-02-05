@@ -3,7 +3,7 @@ name: Build ReviewCrawler EXE
 on:
   push:
     branches: [ main ]
-  workflow_dispatch: # 수동 실행 버튼 활성화
+  workflow_dispatch:
 
 jobs:
   build:
@@ -17,8 +17,8 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        cache: 'pip' # 빌드 속도 향상을 위한 캐싱
-    
+        cache: 'pip'
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
@@ -26,12 +26,12 @@ jobs:
     
     - name: Build EXE
       run: |
-        # --name "ReviewCrawler"로 설정하면 파일명이 ReviewCrawler.exe가 됩니다.
-        # 파일명이 ReviewCrawler.py가 아니라면 아래 이름을 실제 파일명으로 수정하세요!
-        pyinstaller --onefile --windowed --clean --name "ReviewCrawler" ReviewCrawler.py
+        # --name "ReviewCrawler"는 결과물 EXE 파일의 이름입니다.
+        # 마지막의 review_crawler.py는 실제 소스 파일명입니다.
+        pyinstaller --onefile --windowed --clean --name "ReviewCrawler" review_crawler.py
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ReviewCrawler-Windows-Binary
+        name: ReviewCrawler-EXE-Package
         path: dist/ReviewCrawler.exe
