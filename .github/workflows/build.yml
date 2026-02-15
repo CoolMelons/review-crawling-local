@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: write # Release 수정 권한
+      contents: write # Release 생성/수정 권한
 
     steps:
     - name: Checkout code
@@ -32,17 +32,31 @@ jobs:
         # 파일명을 실제 파일인 review_crawler.py로 설정
         pyinstaller --onefile --windowed --clean --name "ReviewCrawler" review_crawler.py
 
-    - name: Update Latest Release
+    # ✅ (1번 방식) run_number로 자동 버전 증가: v1, v2, v3...
+    # 파일도 같이 버전명으로 바꿔서 릴리즈/아티팩트에 올라가게 함
+    - name: Rename EXE with version
+      run: |
+        ren dist\ReviewCrawler.exe ReviewCrawler_v${{ github.run_number }}.exe
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: review-crawler-exe-v${{ github.run_number }}
+        path: dist/ReviewCrawler_v${{ github.run_number }}.exe
+
+    - name: Create Versioned Release (v1, v2, v3...)
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: "latest"
-        name: "ReviewCrawler 최신 버전 (자동 빌드)" # 요청하신 제목으로 수정
+        tag_name: v${{ github.run_number }}
+        name: ReviewCrawler v${{ github.run_number }} (자동 빌드)
         body: |
-          본 파일은 최신 소스 코드가 push 될 때마다 자동으로 업데이트됩니다.
+          본 파일은 main 브랜치에 push 될 때마다 자동으로 새 버전(v1, v2, v3...)으로 릴리즈됩니다.
+          빌드 번호: v${{ github.run_number }}
           마지막 업데이트 일시: ${{ github.event.head_commit.timestamp }}
+          커밋 SHA: ${{ github.sha }}
         draft: false
         prerelease: false
-        files: dist/ReviewCrawler.exe
+        files: dist/ReviewCrawler_v${{ github.run_number }}.exe
         make_latest: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
