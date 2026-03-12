@@ -1,16 +1,13 @@
 name: Build and Auto Update Release
-
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: write # Release 생성/수정 권한
-
+      contents: write
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -27,13 +24,15 @@ jobs:
         pip install -r requirements.txt
         pip install pyinstaller
 
+    - name: Verify selenium install
+      run: |
+        python -c "import selenium; print(selenium.__version__)"
+        python -c "from selenium.webdriver.chrome.webdriver import WebDriver; print('OK')"
+
     - name: Build EXE
       run: |
-        # 파일명을 실제 파일인 review_crawler.py로 설정
-        pyinstaller --onefile --windowed --clean --name "ReviewCrawler" review_crawler.py
+        pyinstaller --onefile --windowed --clean --name "ReviewCrawler" --collect-all selenium --collect-all pandas --collect-all openpyxl --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.options --hidden-import selenium.webdriver.common.by --hidden-import selenium.webdriver.support.ui --hidden-import selenium.webdriver.support.expected_conditions --hidden-import selenium.common.exceptions review_crawler.py
 
-    # ✅ (1번 방식) run_number로 자동 버전 증가: v1, v2, v3...
-    # 파일도 같이 버전명으로 바꿔서 릴리즈/아티팩트에 올라가게 함
     - name: Rename EXE with version
       run: |
         ren dist\ReviewCrawler.exe ReviewCrawler_v${{ github.run_number }}.exe
