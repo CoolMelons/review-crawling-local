@@ -32,7 +32,7 @@ REGION_AREAS = {
 # =========================
 # KLOOK 옵션
 # =========================
-KLOOK_AUTO_PARTICIPATION_TIME = True
+KLOOK_AUTO_DATE_DROPDOWN = True   # 드롭다운 (Participation time / Reviewed date) 자동 선택
 KLOOK_AUTO_DATE_FILTER = True
 KLOOK_AUTO_50_PER_PAGE = True
 KLOOK_PAGE_SIZE = 30
@@ -54,7 +54,7 @@ class ReviewCollectorNew:
     def __init__(self):
         self.root = Tk()
         self.root.title("📋 리뷰 자동 수집기")
-        self.root.geometry("650x1000")
+        self.root.geometry("650x1050")
 
         self.driver = None
         self.reservation_file = None
@@ -91,27 +91,43 @@ class ReviewCollectorNew:
 
         Label(mode_frame, text="🔧 작업 모드 선택", font=("Arial", 12, "bold")).pack(anchor="w")
 
-        self.mode_var = StringVar(value="collect")  # "collect" 또는 "regenerate"
+        # ✅ 3가지 모드: collect_review / collect_participation / regenerate
+        self.mode_var = StringVar(value="collect_review")
 
-        # ✅ 가로 배치
-        mode_line = Frame(mode_frame)
-        mode_line.pack(anchor="w", pady=5)
+        # 세로 배치 (3개라 가로배치하면 길어짐)
+        Radiobutton(mode_frame, text="리뷰 날짜 기준 수집",
+                    variable=self.mode_var, value="collect_review",
+                    command=self._on_mode_change, font=("Arial", 10)).pack(anchor="w", pady=2)
 
-        Radiobutton(mode_line, text="리뷰 수집",
-                    variable=self.mode_var, value="collect",
-                    command=self._on_mode_change, font=("Arial", 10)).pack(side="left", padx=(0, 15))
+        Radiobutton(mode_frame, text="참여 날짜 기준 수집",
+                    variable=self.mode_var, value="collect_participation",
+                    command=self._on_mode_change, font=("Arial", 10)).pack(anchor="w", pady=2)
 
-        Radiobutton(mode_line, text="Guide 종합 재계산 및 재생성",
+        Radiobutton(mode_frame, text="Guide 종합 재계산 및 재생성",
                     variable=self.mode_var, value="regenerate",
-                    command=self._on_mode_change, font=("Arial", 10)).pack(side="left")
+                    command=self._on_mode_change, font=("Arial", 10)).pack(anchor="w", pady=2)
 
         # 각 모드별 컨테이너
         self.collect_container = Frame(self.root)
         self.regenerate_container = Frame(self.root)
 
         # ============================================================
-        # 수집 모드 UI
+        # 수집 모드 UI (리뷰 날짜 기준 / 참여 날짜 기준 공용)
         # ============================================================
+
+        # 0. 모드 안내 라벨 (현재 어떤 날짜 기준인지 표시)
+        mode_info_frame = Frame(self.collect_container, relief="ridge", borderwidth=1, padx=10, pady=8, bg="#FFF9E6")
+        mode_info_frame.pack(fill="x", padx=20, pady=5)
+
+        self.mode_info_label = Label(
+            mode_info_frame,
+            text="",
+            font=("Arial", 10, "bold"),
+            bg="#FFF9E6",
+            fg="#7A5F00",
+            justify="left"
+        )
+        self.mode_info_label.pack(anchor="w")
 
         # 1. 날짜
         frame1 = Frame(self.collect_container, relief="solid", borderwidth=1, padx=10, pady=10)
@@ -199,7 +215,6 @@ class ReviewCollectorNew:
         frame5.pack(fill="x", padx=20, pady=5)
 
         Label(frame5, text="5️⃣ 에이전시 선택", font=("Arial", 12, "bold")).pack(anchor="w")
-        # ✅ 4번처럼 안내문을 위에 둠
         Label(frame5, text="※ 체크된 에이전시만 수집/엑셀 출력됩니다.", font=("Arial", 9), fg="gray").pack(anchor="w")
 
         Checkbutton(frame5, text="전체선택", variable=self.all_var, command=self.on_toggle_all).pack(anchor="w")
@@ -221,7 +236,7 @@ class ReviewCollectorNew:
         Label(self.collect_container, textvariable=self.progress_var, font=("Arial", 9)).pack(pady=5)
 
         # ============================================================
-        # 재생성 모드 UI (✅ 중간 'Guide 시트 재생성' 큰 타이틀 제거)
+        # 재생성 모드 UI
         # ============================================================
 
         # 1) 리뷰 엑셀 파일 선택
@@ -318,7 +333,6 @@ class ReviewCollectorNew:
             areas.extend(REGION_AREAS.get("JAPAN", []))
         if self.region_aus_var.get():
             areas.extend(REGION_AREAS.get("AUSTRALIA", []))
-        # 중복 제거 (순서 유지)
         seen = set()
         out = []
         for a in areas:
@@ -328,14 +342,31 @@ class ReviewCollectorNew:
         return out
 
     def _on_mode_change(self):
-        """모드 전환 시 해당 컨테이너만 표시"""
+        """모드 전환 시 해당 컨테이너만 표시 + 안내 라벨 갱신"""
         mode = self.mode_var.get()
 
         self.collect_container.pack_forget()
         self.regenerate_container.pack_forget()
 
-        if mode == "collect":
+        if mode in ("collect_review", "collect_participation"):
             self.collect_container.pack(fill="both", expand=True)
+
+            # 모드별 안내 메시지
+            if mode == "collect_review":
+                self.mode_info_label.config(
+                    text=("📌 [리뷰 날짜 기준 수집]\n"
+                          "  • KLOOK: 'Reviewed date' 드롭다운 선택\n"
+                          "  • KKDAY: 'Release date' 라벨에서 날짜 선택\n"
+                          "  • GG: 'Review date' 입력란에서 날짜 선택")
+                )
+            else:
+                self.mode_info_label.config(
+                    text=("📌 [참여 날짜 기준 수집]\n"
+                          "  • KLOOK: 'Participation time' 드롭다운 선택\n"
+                          "  • KKDAY: 'Departure date' 라벨에서 날짜 선택\n"
+                          "  • GG: 'Activity date' 입력란에서 날짜 선택")
+                )
+
         elif mode == "regenerate":
             self.regenerate_container.pack(fill="both", expand=True)
 
@@ -365,10 +396,7 @@ class ReviewCollectorNew:
             print(f"📁 예약 파일 선택: {filename}")
 
     def execute_regenerate(self):
-        """Guide 시트 재생성 실행
-        - 예약 파일 사용 체크 + 파일 있음: 기존대로 재계산(Team/Tour/Review 전부 재생성)
-        - 예약 파일 미사용: 기존 Guide의 Team/Tour 유지 + Review Count/%만 업데이트
-        """
+        """Guide 시트 재생성 실행"""
         if not self.regen_excel_file:
             messagebox.showerror("오류", "리뷰 엑셀 파일을 선택하세요!")
             return
@@ -393,7 +421,6 @@ class ReviewCollectorNew:
         try:
             wb = load_workbook(self.regen_excel_file)
 
-            # 1) 리뷰 시트들에서 현재 리뷰 데이터 읽기
             review_sheets = [name for name in wb.sheetnames if name != "Guide"]
             matched_df = self._read_reviews_from_workbook(wb, review_sheets)
 
@@ -404,14 +431,12 @@ class ReviewCollectorNew:
                 return
 
             if use_res:
-                # 2) 예약 파일 읽기
                 reservation_df = pd.read_excel(self.regen_reservation_file)
                 reservation_df.columns = reservation_df.columns.str.strip()
                 reservation_df['Date'] = pd.to_datetime(reservation_df['Date'], errors='coerce')
 
                 areas_to_make = review_sheets
 
-                # 3) Guide 시트 완전 재생성 (기존 방식)
                 self.create_guide_sheet_original_style_openpyxl(wb, matched_df, reservation_df, areas_to_make)
                 wb.save(self.regen_excel_file)
                 wb.close()
@@ -420,7 +445,6 @@ class ReviewCollectorNew:
                 messagebox.showinfo("완료", f"Guide 시트 재생성 완료!\n\n파일: {os.path.basename(self.regen_excel_file)}")
                 return
 
-            # ✅ 예약 파일 미사용: 기존 Guide의 Team/Tour 유지 + Review Count/%만 업데이트
             ok = self.update_guide_review_only_keep_team_tour(wb, matched_df)
             wb.save(self.regen_excel_file)
             wb.close()
@@ -433,7 +457,6 @@ class ReviewCollectorNew:
                 messagebox.showinfo("완료", f"Guide 시트 업데이트 완료!\n(Team/Tour 유지 + Review Count/% 갱신)\n\n파일: {os.path.basename(self.regen_excel_file)}")
 
         except Exception as e:
-            # 콘솔/로그 확인용
             import traceback
             traceback.print_exc()
             self.regen_progress_var.set("오류 발생")
@@ -538,14 +561,19 @@ class ReviewCollectorNew:
             messagebox.showerror("오류", "시작일이 종료일보다 늦습니다!")
             return
 
+        # ✅ 모드별 date_mode 결정
+        mode = self.mode_var.get()
+        date_mode = "review_date" if mode == "collect_review" else "participation"
+        mode_name = "리뷰 날짜 기준" if date_mode == "review_date" else "참여 날짜 기준"
+
         print(f"\n{'=' * 80}")
-        print("🚀 리뷰 수집 시작")
+        print(f"🚀 리뷰 수집 시작 ({mode_name})")
         print(f"📅 기간: {start_date} ~ {end_date}")
         print(f"🏷 선택 에이전시: {selected_agencies}")
         print(f"🗺 선택 지역: {selected_areas}")
         print(f"{'=' * 80}\n")
 
-        self.progress_var.set("처리 중...")
+        self.progress_var.set(f"처리 중... ({mode_name})")
         self.root.update()
 
         try:
@@ -580,14 +608,20 @@ class ReviewCollectorNew:
 
             print(f"✅ 기간 내 예약(선택 에이전시): {len(period_df)}개\n")
 
-            all_reviews = self.collect_all_reviews(start_date, end_date, enabled_agencies=selected_agencies)
+            # ✅ date_mode 전달
+            all_reviews = self.collect_all_reviews(
+                start_date, end_date,
+                enabled_agencies=selected_agencies,
+                date_mode=date_mode
+            )
 
             output_file = self.create_excel_output_reviews_only(
                 period_df=period_df,
                 all_reviews=all_reviews,
                 start_date=start_date,
                 end_date=end_date,
-                selected_areas=selected_areas
+                selected_areas=selected_areas,
+                date_mode=date_mode
             )
 
             print(f"\n{'=' * 80}")
@@ -597,7 +631,7 @@ class ReviewCollectorNew:
 
             self.last_output_file = output_file
             self.progress_var.set("완료!")
-            messagebox.showinfo("완료", f"리뷰 수집 완료!\n\n파일 저장 위치:\n{output_file}")
+            messagebox.showinfo("완료", f"리뷰 수집 완료! ({mode_name})\n\n파일 저장 위치:\n{output_file}")
 
         except Exception as e:
             import traceback
@@ -608,28 +642,34 @@ class ReviewCollectorNew:
     # -------------------------
     # Collect All (선택된 에이전시만)
     # -------------------------
-    def collect_all_reviews(self, start_date, end_date, enabled_agencies):
+    def collect_all_reviews(self, start_date, end_date, enabled_agencies, date_mode="participation"):
         all_reviews = {'L': {}, 'KK': {}, 'GG': {}}
 
         if "L" in enabled_agencies:
-            print("\n🔍 KLOOK(L) 리뷰 수집 중...")
-            klook_reviews = self.collect_klook_reviews_two_stars(start_date, end_date, stars=[5, 4])
+            print(f"\n🔍 KLOOK(L) 리뷰 수집 중... (mode={date_mode})")
+            klook_reviews = self.collect_klook_reviews_two_stars(
+                start_date, end_date, stars=[5, 4], date_mode=date_mode
+            )
             all_reviews['L'].update(klook_reviews)
             print(f"✅ KLOOK(L): 총 {len(all_reviews['L'])}개\n")
         else:
             print("\n⏭ KLOOK(L) 스킵 (체크 안됨)")
 
         if "KK" in enabled_agencies:
-            print("🔍 KKDAY(KK) 리뷰 수집 중...")
-            kk_reviews = self.collect_kkday_reviews_range(start_date, end_date)
+            print(f"🔍 KKDAY(KK) 리뷰 수집 중... (mode={date_mode})")
+            kk_reviews = self.collect_kkday_reviews_range(
+                start_date, end_date, date_mode=date_mode
+            )
             all_reviews['KK'].update(kk_reviews)
             print(f"✅ KK: 총 {len(all_reviews['KK'])}개\n")
         else:
             print("⏭ KK 스킵 (체크 안됨)")
 
         if "GG" in enabled_agencies:
-            print("🔍 GetYourGuide(GG) 리뷰 수집 중...")
-            gg_reviews = self.collect_gg_reviews(start_date, end_date)
+            print(f"🔍 GetYourGuide(GG) 리뷰 수집 중... (mode={date_mode})")
+            gg_reviews = self.collect_gg_reviews(
+                start_date, end_date, date_mode=date_mode
+            )
             all_reviews['GG'].update(gg_reviews)
             print(f"✅ GG: 총 {len(all_reviews['GG'])}개\n")
         else:
@@ -638,26 +678,30 @@ class ReviewCollectorNew:
         return all_reviews
 
     # ============================================================
-    # KLOOK (원본 유지)
+    # KLOOK
     # ============================================================
-    def collect_klook_reviews_two_stars(self, start_date, end_date, stars=(5, 4)):
+    def collect_klook_reviews_two_stars(self, start_date, end_date, stars=(5, 4), date_mode="participation"):
         reviews = {}
         chunks = self._split_into_monthly_chunks(start_date, end_date)
 
         print(f"  📅 KLOOK 월 분할: {len(chunks)}개 청크")
         for i, (chunk_start, chunk_end) in enumerate(chunks, 1):
             print(f"\n  🔄 KLOOK 청크 {i}/{len(chunks)}: {chunk_start} ~ {chunk_end}")
-            self._klook_collect_single_month(chunk_start, chunk_end, stars, reviews)
+            self._klook_collect_single_month(chunk_start, chunk_end, stars, reviews, date_mode=date_mode)
             print(f"  ✅ 청크 {i} 완료 (누적 {len(reviews)}개)")
 
         return reviews
 
-    def _klook_collect_single_month(self, start_date, end_date, stars, reviews):
+    def _klook_collect_single_month(self, start_date, end_date, stars, reviews, date_mode="participation"):
         self.driver.get("https://merchant.klook.com/reviews")
         time.sleep(2)
 
-        if KLOOK_AUTO_PARTICIPATION_TIME:
-            self._klook_set_participation_time()
+        # ✅ 모드별 드롭다운 옵션 분기
+        if KLOOK_AUTO_DATE_DROPDOWN:
+            if date_mode == "review_date":
+                self._klook_set_date_dropdown("Reviewed date")
+            else:
+                self._klook_set_date_dropdown("Participation time")
 
         if KLOOK_AUTO_DATE_FILTER:
             ok = self._klook_apply_date_filter(start_date, end_date)
@@ -693,29 +737,32 @@ class ReviewCollectorNew:
             pass
         time.sleep(0.6)
 
-    def _klook_set_participation_time(self):
+    def _klook_set_date_dropdown(self, option_text):
+        """KLOOK 드롭다운에서 옵션 선택 (Participation time 또는 Reviewed date)"""
         try:
             product_dropdown = WebDriverWait(self.driver, 10).until(
                 EC.element_to_be_clickable((By.XPATH,
-                                            '//*[@id="klook-content"]/div/div[1]/div[1]/div/div[1]/form[2]/div[1]/div[2]/div/span'
-                                            ))
+                    '//*[@id="klook-content"]/div/div[1]/div[1]/div/div[1]/form[2]/div[1]/div[2]/div/span'
+                ))
             )
             product_dropdown.click()
             time.sleep(0.5)
 
             wait = WebDriverWait(self.driver, 10)
-            opt = wait.until(EC.element_to_be_clickable((By.XPATH, '//li[contains(text(), "Participation time")]')))
+            opt = wait.until(EC.element_to_be_clickable(
+                (By.XPATH, f'//li[contains(text(), "{option_text}")]')
+            ))
             opt.click()
             time.sleep(0.5)
 
-            print("  ✅ Participation time 선택 완료")
+            print(f"  ✅ KLOOK '{option_text}' 선택 완료")
             return True
 
         except TimeoutException:
-            print("  ⚠ Participation time 옵션을 찾지 못해 시간 초과되었습니다.")
+            print(f"  ⚠ KLOOK '{option_text}' 옵션을 찾지 못해 시간 초과되었습니다.")
             return False
         except Exception as e:
-            print(f"  ⚠ Participation time 선택 실패: {e}")
+            print(f"  ⚠ KLOOK '{option_text}' 선택 실패: {e}")
             return False
 
     def _klook_apply_date_filter(self, start_date, end_date):
@@ -1077,26 +1124,32 @@ class ReviewCollectorNew:
                 cur = end_date.__class__(cur.year, cur.month + 1, 1)
         return chunks
 
-    def collect_kkday_reviews_range(self, start_date, end_date):
+    def collect_kkday_reviews_range(self, start_date, end_date, date_mode="participation"):
         reviews = {}
         chunks = self._split_into_monthly_chunks(start_date, end_date)
 
         print(f"  📅 KKDAY 월 분할: {len(chunks)}개 청크")
         for i, (chunk_start, chunk_end) in enumerate(chunks, 1):
             print(f"\n  🔄 KKDAY 청크 {i}/{len(chunks)}: {chunk_start} ~ {chunk_end}")
-            self._kkday_collect_single_month(chunk_start, chunk_end, reviews)
+            self._kkday_collect_single_month(chunk_start, chunk_end, reviews, date_mode=date_mode)
             print(f"  ✅ 청크 {i} 완료 (누적 {len(reviews)}개)")
 
         return reviews
 
-    def _kkday_collect_single_month(self, start_date, end_date, reviews):
+    def _kkday_collect_single_month(self, start_date, end_date, reviews, date_mode="participation"):
         self.driver.get("https://scm.kkday.com/v1/en/comment/index")
         time.sleep(2)
 
         self._kkday_click_reset()
 
-        if not self._kkday_set_departure_date_range(start_date, end_date):
-            print("  ❌ KKDAY 날짜 선택 실패")
+        # ✅ 모드별 분기: Release date(리뷰) vs Departure date(참여)
+        if date_mode == "review_date":
+            ok = self._kkday_set_release_date_range(start_date, end_date)
+        else:
+            ok = self._kkday_set_departure_date_range(start_date, end_date)
+
+        if not ok:
+            print(f"  ❌ KKDAY 날짜 선택 실패 (mode={date_mode})")
             return reviews
 
         self._kkday_set_rating_4_5_only()
@@ -1108,7 +1161,7 @@ class ReviewCollectorNew:
         while page <= KKDAY_MAX_PAGES:
             if not self._kkday_wait_results_ready():
                 print("  ⚠ KKDAY 결과가 안 보임 → 필터 복구 후 Search 재시도")
-                self._kkday_restore_filters_and_search(start_date, end_date, sig)
+                self._kkday_restore_filters_and_search(start_date, end_date, sig, date_mode=date_mode)
                 if not self._kkday_wait_results_ready():
                     print("  ❌ 복구 후에도 결과 없음(로그인/권한/셀렉터 확인 필요)")
                     break
@@ -1167,6 +1220,41 @@ class ReviewCollectorNew:
                 continue
         return False
 
+    def _kkday_open_release_date_picker(self):
+        """Release date 픽커 열기 (리뷰 날짜 기준 모드용)"""
+        candidates = [
+            # ✅ label 텍스트로 찾기 (가장 안전)
+            ('//label[normalize-space(.)="Release date"]', "label_text"),
+            # 백업: 사용자가 알려준 절대경로
+            ('//*[@id="defaultLayout"]/div/section[2]/div[1]/div[2]/div[1]/div/div[1]/div[2]/div/div//input', "abs_path_input"),
+        ]
+        for xp, _name in candidates:
+            try:
+                if "label" in _name:
+                    label = WebDriverWait(self.driver, KKDAY_WAIT).until(
+                        EC.presence_of_element_located((By.XPATH, xp))
+                    )
+                    container = label.find_element(By.XPATH, "./..")
+                    try:
+                        inp = container.find_element(By.XPATH, ".//input")
+                    except:
+                        inp = label.find_element(By.XPATH, ".//following::input[1]")
+                else:
+                    inp = WebDriverWait(self.driver, KKDAY_WAIT).until(
+                        EC.element_to_be_clickable((By.XPATH, xp))
+                    )
+
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+                time.sleep(0.2)
+                self.driver.execute_script("arguments[0].click();", inp)
+                time.sleep(0.6)
+                print("  ✅ KKDAY Release date 픽커 열림")
+                return True
+            except:
+                continue
+        print("  ⚠ KKDAY Release date 픽커 열기 실패")
+        return False
+
     def _kkday_find_calendar_table_for_month(self, target_date):
         month_map = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
         target_header = f"{month_map[target_date.month - 1]} {target_date.year}"
@@ -1219,10 +1307,8 @@ class ReviewCollectorNew:
                 continue
         return False
 
-    def _kkday_set_departure_date_range(self, start_date, end_date):
-        if not self._kkday_open_departure_date_picker():
-            return False
-
+    def _kkday_pick_date_range(self, start_date, end_date):
+        """공통: 캘린더에서 start ~ end 날짜 클릭 (Departure / Release 둘 다 사용)"""
         def get_table_or_move(dt):
             tbl = self._kkday_find_calendar_table_for_month(dt)
             if tbl:
@@ -1256,8 +1342,26 @@ class ReviewCollectorNew:
             return False
 
         time.sleep(0.5)
-        print(f"  ✅ KKDAY 날짜 선택 완료: {start_date} ~ {end_date}")
         return True
+
+    def _kkday_set_departure_date_range(self, start_date, end_date):
+        if not self._kkday_open_departure_date_picker():
+            return False
+
+        ok = self._kkday_pick_date_range(start_date, end_date)
+        if ok:
+            print(f"  ✅ KKDAY Departure date 선택 완료: {start_date} ~ {end_date}")
+        return ok
+
+    def _kkday_set_release_date_range(self, start_date, end_date):
+        """Release date 범위 선택"""
+        if not self._kkday_open_release_date_picker():
+            return False
+
+        ok = self._kkday_pick_date_range(start_date, end_date)
+        if ok:
+            print(f"  ✅ KKDAY Release date 선택 완료: {start_date} ~ {end_date}")
+        return ok
 
     def _kkday_set_rating_4_5_only(self):
         try:
@@ -1528,9 +1632,12 @@ class ReviewCollectorNew:
             return False
         return False
 
-    def _kkday_restore_filters_and_search(self, start_date, end_date, sig):
+    def _kkday_restore_filters_and_search(self, start_date, end_date, sig, date_mode="participation"):
         self._kkday_click_reset()
-        self._kkday_set_departure_date_range(start_date, end_date)
+        if date_mode == "review_date":
+            self._kkday_set_release_date_range(start_date, end_date)
+        else:
+            self._kkday_set_departure_date_range(start_date, end_date)
         if sig.get("cb4") or sig.get("cb5"):
             self._kkday_set_rating_4_5_only()
         self._kkday_click_search()
@@ -1538,7 +1645,7 @@ class ReviewCollectorNew:
     # ============================================================
     # GG (GetYourGuide)
     # ============================================================
-    def collect_gg_reviews(self, start_date, end_date):
+    def collect_gg_reviews(self, start_date, end_date, date_mode="participation"):
         reviews = {}
 
         self.driver.get(GG_URL)
@@ -1549,10 +1656,18 @@ class ReviewCollectorNew:
             print("  ❌ GG More filters 클릭 실패")
             return reviews
 
-        gg_start = start_date - timedelta(days=1)
-        if not self._gg_set_activity_date(gg_start, end_date):
-            print("  ❌ GG Activity date 설정 실패")
-            return reviews
+        # ✅ 모드별 분기
+        if date_mode == "review_date":
+            # Review date는 -1일 보정 없이 그대로
+            if not self._gg_set_review_date(start_date, end_date):
+                print("  ❌ GG Review date 설정 실패")
+                return reviews
+        else:
+            # 기존 Activity date 로직 (-1일 보정 유지)
+            gg_start = start_date - timedelta(days=1)
+            if not self._gg_set_activity_date(gg_start, end_date):
+                print("  ❌ GG Activity date 설정 실패")
+                return reviews
 
         if not self._gg_set_rating_4_5():
             print("  ⚠ GG Rating 필터 설정 실패 (필터 없이 수집 진행)")
@@ -1593,13 +1708,53 @@ class ReviewCollectorNew:
             return False
 
     def _gg_set_activity_date(self, start_date, end_date):
+        """기존: Activity date 설정 (참여 날짜 모드)"""
+        # ✅ Activity date input을 명확히 지목 (type="activityDateRange" 컨테이너로 한정)
+        selector = '[type="activityDateRange"] [data-testid="filters-date-range-selector"] input'
+        # 백업: 기존 셀렉터 (Activity date가 먼저 나오므로 이것도 잡힘)
+        fallback_selector = '[data-testid="filters-date-range-selector"] input'
+
+        return self._gg_set_date_range_generic(
+            start_date, end_date,
+            primary_selector=selector,
+            fallback_selector=fallback_selector,
+            label="Activity date"
+        )
+
+    def _gg_set_review_date(self, start_date, end_date):
+        """신규: Review date 설정 (리뷰 날짜 모드)"""
+        # ✅ type="reviewDateRange" 컨테이너로 한정
+        selector = '[type="reviewDateRange"] [data-testid="filters-date-range-selector"] input'
+
+        return self._gg_set_date_range_generic(
+            start_date, end_date,
+            primary_selector=selector,
+            fallback_selector=None,  # Review date는 백업 없음 (반드시 컨테이너로 한정해야 함)
+            label="Review date"
+        )
+
+    def _gg_set_date_range_generic(self, start_date, end_date, primary_selector, fallback_selector, label):
+        """GG 날짜 범위 설정 공통 로직"""
         for attempt in range(3):
             try:
-                print(f"  📌 GG 날짜 설정 시도 {attempt + 1}/3")
+                print(f"  📌 GG {label} 설정 시도 {attempt + 1}/3")
 
-                date_input = WebDriverWait(self.driver, GG_WAIT).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, '[data-testid="filters-date-range-selector"] input'))
-                )
+                # primary 시도
+                date_input = None
+                try:
+                    date_input = WebDriverWait(self.driver, GG_WAIT).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, primary_selector))
+                    )
+                except:
+                    if fallback_selector:
+                        date_input = WebDriverWait(self.driver, GG_WAIT).until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, fallback_selector))
+                        )
+
+                if date_input is None:
+                    print(f"    ⚠ {label} input을 찾지 못함")
+                    continue
+
                 self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", date_input)
                 time.sleep(0.3)
                 date_input.click()
@@ -1619,6 +1774,7 @@ class ReviewCollectorNew:
 
                 time.sleep(0.8)
 
+                # 패널이 닫혔으면 다시 열기
                 panel_still_open = True
                 try:
                     WebDriverWait(self.driver, 2).until(
@@ -1642,39 +1798,57 @@ class ReviewCollectorNew:
 
                 time.sleep(0.8)
 
-                value = self._gg_read_date_input_value()
-                print(f"    📋 input value 현재: '{value}'")
+                # value 확인
+                value = self._gg_read_input_value(primary_selector, fallback_selector)
+                print(f"    📋 {label} input value: '{value}'")
 
                 if " - " in (value or ""):
-                    print(f"  ✅ GG Activity date 설정 완료: {value}")
+                    print(f"  ✅ GG {label} 설정 완료: {value}")
                     self._gg_close_date_panel()
                     return True
                 else:
-                    print("    ⚠ value에 범위가 없음 → retry")
+                    print(f"    ⚠ value에 범위가 없음 → retry")
                     self._gg_close_date_panel()
                     time.sleep(0.5)
                     continue
 
             except Exception as e:
-                print(f"    ⚠ GG Activity date 시도 {attempt + 1} 실패: {e}")
+                print(f"    ⚠ GG {label} 시도 {attempt + 1} 실패: {e}")
                 continue
 
-        print("  ❌ GG Activity date 설정 3회 모두 실패")
+        print(f"  ❌ GG {label} 설정 3회 모두 실패")
         return False
 
-    def _gg_read_date_input_value(self):
-        try:
-            inp = self.driver.find_element(By.CSS_SELECTOR, '[data-testid="filters-date-range-selector"] input')
-            val = inp.get_attribute("value") or ""
-            return val.strip()
-        except:
-            return ""
+    def _gg_read_input_value(self, primary_selector, fallback_selector):
+        """현재 날짜 input의 value 읽기"""
+        for sel in [primary_selector, fallback_selector]:
+            if not sel:
+                continue
+            try:
+                inp = self.driver.find_element(By.CSS_SELECTOR, sel)
+                val = (inp.get_attribute("value") or "").strip()
+                if val:
+                    return val
+            except:
+                continue
+        return ""
 
     def _gg_close_date_panel(self):
         try:
             from selenium.webdriver.common.keys import Keys as K
-            self.driver.find_element(By.CSS_SELECTOR, '[data-testid="filters-date-range-selector"] input').send_keys(K.ESCAPE)
-            time.sleep(0.3)
+            # 마지막으로 사용한 input 기준으로 ESC 보내기 (가능한 셀렉터 모두 시도)
+            for sel in [
+                '[type="reviewDateRange"] [data-testid="filters-date-range-selector"] input',
+                '[type="activityDateRange"] [data-testid="filters-date-range-selector"] input',
+                '[data-testid="filters-date-range-selector"] input',
+            ]:
+                try:
+                    el = self.driver.find_element(By.CSS_SELECTOR, sel)
+                    el.send_keys(K.ESCAPE)
+                    time.sleep(0.2)
+                    break
+                except:
+                    continue
         except:
             pass
         try:
@@ -2019,7 +2193,8 @@ class ReviewCollectorNew:
     # ============================================================
     # Excel: 리뷰 있는 것만 저장
     # ============================================================
-    def create_excel_output_reviews_only(self, period_df, all_reviews, start_date, end_date, selected_areas=None):
+    def create_excel_output_reviews_only(self, period_df, all_reviews, start_date, end_date,
+                                          selected_areas=None, date_mode="participation"):
         print("\n📊 엑셀 파일 생성(리뷰 있는 것만) 중...")
 
         matched = []
@@ -2075,7 +2250,9 @@ class ReviewCollectorNew:
                 na_position="last"
             ).drop(columns=["__agency_rank", "__star_rank"])
 
-        output_filename = f"Review_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+        # ✅ 파일명에 모드 표시 (리뷰 vs 참여)
+        mode_tag = "RD" if date_mode == "review_date" else "PD"  # RD=ReviewDate, PD=ParticipationDate
+        output_filename = f"Review_{mode_tag}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
 
         with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
             areas_to_make = selected_areas if selected_areas else AREAS
@@ -2205,7 +2382,6 @@ class ReviewCollectorNew:
 
     # ============================================================
     # ✅ 예약 파일 없을 때: 기존 Guide Team/Tour 유지 + Review Count/%만 업데이트
-    # (StyleProxy 에러 방지: 스타일을 set/dict key로 쓰지 않음. 값만 갱신)
     # ============================================================
     def _read_reviews_from_workbook(self, wb, review_sheets):
         rows = []
@@ -2214,8 +2390,6 @@ class ReviewCollectorNew:
             headers = [cell.value for cell in ws[1]]
             header_map = {str(h).strip(): idx for idx, h in enumerate(headers) if h is not None}
 
-            # 기대 컬럼 (Review 수집 파일 포맷)
-            # Tour Date / Review Date / Agency Code / Tour / Star / Review / Guide / Agency
             for row in ws.iter_rows(min_row=2, values_only=True):
                 if not any(row):
                     continue
@@ -2230,7 +2404,6 @@ class ReviewCollectorNew:
                 })
 
         df = pd.DataFrame(rows)
-        # 빈 행 제거
         if df.empty:
             return df
         df["Area"] = df["Area"].astype(str).str.strip()
@@ -2239,20 +2412,12 @@ class ReviewCollectorNew:
         return df
 
     def update_guide_review_only_keep_team_tour(self, wb, matched_df):
-        """Guide 시트에서
-        - 각 Area 블록을 찾아
-        - Guide Name 행별 Review Count / Review %만 새로 계산하여 값만 덮어쓰기
-        - Tour Count / Team Count는 건드리지 않음
-        """
         if "Guide" not in wb.sheetnames:
-            # Guide가 없으면 업데이트 불가
             return False
 
         ws = wb["Guide"]
 
-        # matched_df: columns Area, Guide (Guide 셀은 "김상제, 정옥영" 같은 복수 가능)
-        # area별 guide별 review_count 계산 (복수 이름 분리)
-        review_count_map = {}  # (area, guide_name) -> count
+        review_count_map = {}
         for _, r in matched_df.iterrows():
             area = str(r.get("Area", "")).strip()
             raw_guide = r.get("Guide", "")
@@ -2260,9 +2425,6 @@ class ReviewCollectorNew:
                 key = (area, g)
                 review_count_map[key] = review_count_map.get(key, 0) + 1
 
-        # Guide 시트는 start_col=1부터 6칸씩 블록(Area, 5 columns)
-        # row1: area title, row2: headers, row3~: data until blank guide name
-        # 블록 탐색: row1에서 값이 있고, row2 헤더가 "Guide Name"이면 블록으로 간주
         max_col = ws.max_column
         ok_any = False
 
@@ -2273,7 +2435,6 @@ class ReviewCollectorNew:
 
             if area_name and str(header).strip() == "Guide Name":
                 area = str(area_name).strip()
-                # 데이터 시작
                 r = 3
                 while True:
                     guide_cell = ws.cell(row=r, column=col)
@@ -2283,28 +2444,24 @@ class ReviewCollectorNew:
 
                     guide = str(guide_name).strip()
 
-                    team_count_cell = ws.cell(row=r, column=col + 3)  # Team Count
-                    review_count_cell = ws.cell(row=r, column=col + 1)  # Review Count
-                    review_pct_cell = ws.cell(row=r, column=col + 4)  # Review %
+                    team_count_cell = ws.cell(row=r, column=col + 3)
+                    review_count_cell = ws.cell(row=r, column=col + 1)
+                    review_pct_cell = ws.cell(row=r, column=col + 4)
 
-                    # 기존 Team Count 값 읽기
                     team_count = team_count_cell.value
                     try:
                         team_count_num = float(team_count) if team_count is not None else 0.0
                     except:
                         team_count_num = 0.0
 
-                    # 새 Review Count 계산
                     new_review_count = int(review_count_map.get((area, guide), 0))
                     review_count_cell.value = new_review_count
 
-                    # 새 Review % 계산 (Team Count 유지)
                     if team_count_num > 0:
                         review_pct_cell.value = new_review_count / team_count_num
                     else:
                         review_pct_cell.value = 0
 
-                    # 퍼센트 포맷 유지/설정
                     review_pct_cell.number_format = '0.00%'
 
                     ok_any = True
@@ -2318,7 +2475,6 @@ class ReviewCollectorNew:
         return ok_any
 
     def create_guide_sheet_original_style_openpyxl(self, wb, matched_df, reservation_period_df, areas_to_make):
-        """pd.ExcelWriter 대신 openpyxl로 Guide를 완전 재생성"""
         if "Guide" in wb.sheetnames:
             del wb["Guide"]
         wb.create_sheet("Guide")
@@ -2406,7 +2562,7 @@ class ReviewCollectorNew:
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("리뷰 자동 수집기 시작")
+    print("리뷰 자동 수집기 시작 (3가지 모드)")
     print("=" * 80)
     print("\n⚠️ 먼저 크롬을 디버그 모드로 실행하세요:")
     print("\nWindows:")
