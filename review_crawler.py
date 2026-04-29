@@ -115,20 +115,6 @@ class ReviewCollectorNew:
         # 수집 모드 UI (리뷰 날짜 기준 / 참여 날짜 기준 공용)
         # ============================================================
 
-        # 0. 모드 안내 라벨 (현재 어떤 날짜 기준인지 표시)
-        mode_info_frame = Frame(self.collect_container, relief="ridge", borderwidth=1, padx=10, pady=8, bg="#FFF9E6")
-        mode_info_frame.pack(fill="x", padx=20, pady=5)
-
-        self.mode_info_label = Label(
-            mode_info_frame,
-            text="",
-            font=("Arial", 10, "bold"),
-            bg="#FFF9E6",
-            fg="#7A5F00",
-            justify="left"
-        )
-        self.mode_info_label.pack(anchor="w")
-
         # 1. 날짜
         frame1 = Frame(self.collect_container, relief="solid", borderwidth=1, padx=10, pady=10)
         frame1.pack(fill="x", padx=20, pady=5)
@@ -342,7 +328,7 @@ class ReviewCollectorNew:
         return out
 
     def _on_mode_change(self):
-        """모드 전환 시 해당 컨테이너만 표시 + 안내 라벨 갱신"""
+        """모드 전환 시 해당 컨테이너만 표시"""
         mode = self.mode_var.get()
 
         self.collect_container.pack_forget()
@@ -350,23 +336,6 @@ class ReviewCollectorNew:
 
         if mode in ("collect_review", "collect_participation"):
             self.collect_container.pack(fill="both", expand=True)
-
-            # 모드별 안내 메시지
-            if mode == "collect_review":
-                self.mode_info_label.config(
-                    text=("📌 [리뷰 날짜 기준 수집]\n"
-                          "  • KLOOK: 'Reviewed date' 드롭다운 선택\n"
-                          "  • KKDAY: 'Release date' 라벨에서 날짜 선택\n"
-                          "  • GG: 'Review date' 입력란에서 날짜 선택")
-                )
-            else:
-                self.mode_info_label.config(
-                    text=("📌 [참여 날짜 기준 수집]\n"
-                          "  • KLOOK: 'Participation time' 드롭다운 선택\n"
-                          "  • KKDAY: 'Departure date' 라벨에서 날짜 선택\n"
-                          "  • GG: 'Activity date' 입력란에서 날짜 선택")
-                )
-
         elif mode == "regenerate":
             self.regenerate_container.pack(fill="both", expand=True)
 
@@ -1255,11 +1224,48 @@ class ReviewCollectorNew:
         print("  ⚠ KKDAY Release date 픽커 열기 실패")
         return False
 
+    def _kkday_find_visible_calendar_root(self):
+        """현재 화면에 보이는 daterangepicker 루트 div를 찾기.
+        Release date / Departure date 픽커 모두 동적으로 처리."""
+        # 1순위: daterangepicker 클래스 + 보이는 것
+        candidates = [
+            '//div[contains(@class,"daterangepicker") and contains(@style,"display: block")]',
+            '//div[contains(@class,"daterangepicker")]',
+            '/html/body/div[3]',
+            '/html/body/div[4]',
+            '/html/body/div[5]',
+        ]
+        for xp in candidates:
+            try:
+                els = self.driver.find_elements(By.XPATH, xp)
+                for el in els:
+                    try:
+                        if el.is_displayed():
+                            # 안에 table이 있는지 확인
+                            tbls = el.find_elements(By.XPATH, './/table')
+                            if tbls:
+                                return el
+                    except:
+                        continue
+            except:
+                continue
+        return None
+
     def _kkday_find_calendar_table_for_month(self, target_date):
         month_map = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
         target_header = f"{month_map[target_date.month - 1]} {target_date.year}"
 
-        tables = self.driver.find_elements(By.XPATH, '/html/body/div[3]//table')
+        # ✅ 동적으로 보이는 캘린더 루트 찾기
+        root = self._kkday_find_visible_calendar_root()
+
+        if root is not None:
+            tables = root.find_elements(By.XPATH, './/table')
+        else:
+            # 백업: 전체 body에서 찾기
+            tables = self.driver.find_elements(By.XPATH, '//div[contains(@class,"daterangepicker")]//table')
+            if not tables:
+                tables = self.driver.find_elements(By.XPATH, '/html/body/div[3]//table')
+
         for tbl in tables:
             try:
                 header_el = tbl.find_element(By.XPATH, './/thead/tr[1]/th[2]')
@@ -1268,23 +1274,48 @@ class ReviewCollectorNew:
                     return tbl
             except:
                 continue
+
+        # 디버깅: 어떤 헤더가 보이는지 출력
+        try:
+            headers_seen = []
+            for tbl in tables:
+                try:
+                    h = tbl.find_element(By.XPATH, './/thead/tr[1]/th[2]')
+                    headers_seen.append((h.text or "").strip())
+                except:
+                    pass
+            if headers_seen:
+                print(f"      🔎 보이는 캘린더 헤더: {headers_seen}, 찾는 헤더: {target_header}")
+        except:
+            pass
+
         return None
 
     def _kkday_click_calendar_prev(self):
+        # ✅ 동적으로 보이는 캘린더 루트 안에서 prev 버튼 찾기
+        root = self._kkday_find_visible_calendar_root()
         try:
-            prev_btn = self.driver.find_element(By.XPATH,
-                                                '/html/body/div[3]//th[contains(@class,"prev")] | /html/body/div[3]/div[1]/div[2]/table/thead/tr[1]/th[1]')
-            self.driver.execute_script("arguments[0].click();", prev_btn)
+            if root is not None:
+                btn = root.find_element(By.XPATH, './/th[contains(@class,"prev")]')
+            else:
+                btn = self.driver.find_element(By.XPATH,
+                    '//div[contains(@class,"daterangepicker")]//th[contains(@class,"prev")] | /html/body/div[3]//th[contains(@class,"prev")]')
+            self.driver.execute_script("arguments[0].click();", btn)
             time.sleep(0.25)
             return True
         except:
             return False
 
     def _kkday_click_calendar_next(self):
+        # ✅ 동적으로 보이는 캘린더 루트 안에서 next 버튼 찾기
+        root = self._kkday_find_visible_calendar_root()
         try:
-            next_btn = self.driver.find_element(By.XPATH,
-                                                '/html/body/div[3]//th[contains(@class,"next")] | /html/body/div[3]/div[1]/div[2]/table/thead/tr[1]/th[3]')
-            self.driver.execute_script("arguments[0].click();", next_btn)
+            if root is not None:
+                btn = root.find_element(By.XPATH, './/th[contains(@class,"next")]')
+            else:
+                btn = self.driver.find_element(By.XPATH,
+                    '//div[contains(@class,"daterangepicker")]//th[contains(@class,"next")] | /html/body/div[3]//th[contains(@class,"next")]')
+            self.driver.execute_script("arguments[0].click();", btn)
             time.sleep(0.25)
             return True
         except:
