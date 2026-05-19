@@ -20,13 +20,14 @@ from openpyxl.utils import get_column_letter
 import calendar
 
 REQUIRED_COLS = ["Date", "Area", "Product", "Agency", "Agency Code", "Main Guide", "People"]
-AREAS = ['Seoul', 'Busan', 'Tokyo', 'Osaka', 'Fukuoka', 'Sapporo', 'Sydney']
+AREAS = ['Seoul', 'Busan', 'Tokyo', 'Osaka', 'Nagoya', 'Fukuoka', 'Sapporo', 'Sydney', 'London']
 
 # 지역 그룹 (UI 선택용)
 REGION_AREAS = {
     "KOREA": ["Seoul", "Busan"],
-    "JAPAN": ["Tokyo", "Osaka", "Fukuoka", "Sapporo"],
+    "JAPAN": ["Tokyo", "Osaka", "Nagoya", "Fukuoka", "Sapporo"],
     "AUSTRALIA": ["Sydney"],
+    "UK": ["London"],
 }
 
 # =========================
@@ -54,7 +55,7 @@ class ReviewCollectorNew:
     def __init__(self):
         self.root = Tk()
         self.root.title("📋 리뷰 자동 수집기")
-        self.root.geometry("650x1050")
+        self.root.geometry("650x1080")
 
         self.driver = None
         self.reservation_file = None
@@ -63,6 +64,7 @@ class ReviewCollectorNew:
         self.region_korea_var = BooleanVar(value=True)
         self.region_japan_var = BooleanVar(value=False)
         self.region_aus_var = BooleanVar(value=False)
+        self.region_uk_var = BooleanVar(value=False)
 
         # 5) agency 선택 변수
         self.all_var = BooleanVar(value=True)
@@ -193,8 +195,9 @@ class ReviewCollectorNew:
         region_line.pack(anchor="w", pady=5)
 
         Checkbutton(region_line, text="KOREA (Seoul, Busan)", variable=self.region_korea_var).pack(anchor="w")
-        Checkbutton(region_line, text="JAPAN (Tokyo, Osaka, Fukuoka, Sapporo)", variable=self.region_japan_var).pack(anchor="w")
+        Checkbutton(region_line, text="JAPAN (Tokyo, Osaka, Nagoya, Fukuoka, Sapporo)", variable=self.region_japan_var).pack(anchor="w")
         Checkbutton(region_line, text="AUSTRALIA (Sydney)", variable=self.region_aus_var).pack(anchor="w")
+        Checkbutton(region_line, text="UK (London)", variable=self.region_uk_var).pack(anchor="w")
 
         # 5. 에이전시 선택 UI
         frame5 = Frame(self.collect_container, relief="solid", borderwidth=1, padx=10, pady=10)
@@ -319,6 +322,8 @@ class ReviewCollectorNew:
             areas.extend(REGION_AREAS.get("JAPAN", []))
         if self.region_aus_var.get():
             areas.extend(REGION_AREAS.get("AUSTRALIA", []))
+        if self.region_uk_var.get():
+            areas.extend(REGION_AREAS.get("UK", []))
         seen = set()
         out = []
         for a in areas:
@@ -517,7 +522,7 @@ class ReviewCollectorNew:
         selected_agencies = self.get_selected_agencies()
         selected_areas = self.get_selected_areas()
         if not selected_areas:
-            messagebox.showerror("오류", "지역을 최소 1개 이상 선택하세요! (KOREA/JAPAN/AUSTRALIA)")
+            messagebox.showerror("오류", "지역을 최소 1개 이상 선택하세요! (KOREA/JAPAN/AUSTRALIA/UK)")
             return
 
         if not selected_agencies:
