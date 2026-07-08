@@ -11,38 +11,31 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
         cache: 'pip'
-
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pyinstaller
-
     - name: Verify selenium install
       run: |
         python -c "import selenium; print(selenium.__version__)"
         python -c "from selenium.webdriver.chrome.webdriver import WebDriver; print('OK')"
-
     - name: Build EXE
       run: |
-        pyinstaller --onefile --windowed --clean --name "ReviewCrawler" --collect-all selenium --collect-all pandas --collect-all openpyxl --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.options --hidden-import selenium.webdriver.common.by --hidden-import selenium.webdriver.support.ui --hidden-import selenium.webdriver.support.expected_conditions --hidden-import selenium.common.exceptions review_crawler.py
-
+        pyinstaller --onefile --windowed --clean --name "ReviewCrawler" --collect-all selenium --collect-all pandas --collect-all openpyxl --collect-all reportlab --collect-all tkcalendar --collect-all babel --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.options --hidden-import reportlab.pdfbase._fontdata review_crawler.py
     - name: Rename EXE with version
       run: |
         ren dist\ReviewCrawler.exe ReviewCrawler_v${{ github.run_number }}.exe
-
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: review-crawler-exe-v${{ github.run_number }}
         path: dist/ReviewCrawler_v${{ github.run_number }}.exe
-
     - name: Create Versioned Release (v1, v2, v3...)
       uses: softprops/action-gh-release@v2
       with:
