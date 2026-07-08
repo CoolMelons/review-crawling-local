@@ -45,9 +45,39 @@
 
 ## 🚀 빠른 시작
 
-### 1️⃣ 크롬을 디버그 모드로 실행 (필수 ⭐)
+아래 두 가지 방법 중 편한 방식으로 실행하세요.
 
-프로그램이 로그인 세션을 인식할 수 있도록 **기존에 열린 모든 크롬 창을 닫고** 아래 명령어로 실행하세요.
+### 🔗 GitHub 레포지토리
+👉 **[Review Crawler - 다운로드](https://github.com/CoolMelons/review-crawling-local)**
+
+---
+
+### ✅ 방법 A) Release에서 EXE 다운로드 (가장 쉬움 / 추천)
+
+1. GitHub 저장소 오른쪽 **Releases** 메뉴로 이동
+2. 최신 버전에서 실행 파일(`ReviewCrawler_vN.exe`) 다운로드
+3. 다운로드한 파일 실행
+
+> ⚠️ Windows에서 "알 수 없는 앱" 경고가 뜨면
+> **[추가 정보] → [실행]** 버튼을 눌러 진행하세요.
+
+> 💡 이 exe는 main 브랜치에 push 될 때마다 GitHub Actions가 자동으로 새 버전(v1, v2, v3...)으로 빌드·릴리즈합니다.
+
+---
+
+### ✅ 방법 B) 소스 다운로드 후 Python으로 실행
+
+#### 1️⃣ 다운로드 및 설치
+
+1. GitHub 페이지 상단 **Code → Download ZIP** 클릭 후 압축 해제
+2. 해당 폴더의 터미널(CMD)에서 라이브러리 설치:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+#### 2️⃣ 크롬을 디버그 모드로 실행
+
+기존 크롬을 **모두 닫은 뒤** 실행하세요.
 
 - **Windows:**
   ```cmd
@@ -58,7 +88,17 @@
   /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
   ```
 
-### 2️⃣ 5개 채널 로그인
+#### 3️⃣ 프로그램 실행
+
+```bash
+python review_crawler.py
+```
+
+---
+
+### 🔐 공통) 5개 채널 로그인
+
+exe든 소스든, 실행 전에 아래 5개 채널에 **모두 로그인**되어 있어야 합니다.
 
 - **L (Klook):** https://merchant.klook.com/reviews
 - **KK (KKday):** https://scm.kkday.com/v1/en/comment/index
@@ -66,15 +106,7 @@
 - **TPC (Ctrip):** https://vbooking.ctrip.com/tour/comment_manage/comment/list?bizScene=ACTIVITY
 - **MRT (MyRealTrip):** https://partner.myrealtrip.com/reviews/touractivity
 
-### 3️⃣ 프로그램 실행
-
-`start_main.bat` 더블클릭(필요 라이브러리 자동 설치) 또는 직접 실행:
-
-```bash
-pip install pandas selenium openpyxl reportlab tkcalendar
-python main.py
-```
-
+프로그램 실행 순서:
 1. **🔌 크롬 연결**
 2. **📁 틴트 리포트 엑셀 선택**
 3. 모드 선택 (PFP / Monthly / Quarterly / New Year Party)
@@ -105,7 +137,7 @@ python main.py
 
 ### PFP (성과제)
 
-`Smart Review Crawling` 폴더(main.py 폴더)에 다음 트리로 저장 + **지사별 zip** 자동 생성:
+`Smart Review Crawling` 폴더(실행 폴더)에 다음 트리로 저장 + **지사별 zip** 자동 생성:
 
 ```
 Review Crawling Result 20260629-20260705/
@@ -140,11 +172,11 @@ Review Crawling Result 20260629-20260705/
 
 ## 🔧 참고 / 튜닝 포인트
 
-- 채널 코드가 바뀌면 `main.py` 상단 `CHANNELS`·`CHANNEL_META` 만 수정.
+- 채널 코드가 바뀌면 `review_crawler.py` 상단 `CHANNELS`·`CHANNEL_META` 만 수정.
 - 각 채널 요청은 페이지가 실제 보내는 요청을 **런타임 캡처 후 재요청**하므로 사이트 UI가 바뀌어도 비교적 안전합니다. 단 첫 실행 시 채널별 수집 로그(`→ [L] p1: n행 …`)로 정상 수집을 점검하세요.
 - Klook은 요청 limit과 무관하게 페이지당 30개를 주므로 **total 기준으로 끝까지** 페이지네이션합니다.
 - MRT 토큰은 자주 만료됨 → 조회 직전 MRT 페이지가 로그인 상태여야 함(도구가 localStorage 토큰 사용).
-- 스페셜 카테고리 키워드는 `main.py`의 `SPECIAL_PRODUCT_KEYS`에서 관리.
+- 스페셜 카테고리 키워드는 `review_crawler.py`의 `SPECIAL_PRODUCT_KEYS`에서 관리.
 
 ---
 
