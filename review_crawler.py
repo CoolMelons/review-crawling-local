@@ -1,2595 +1,2314 @@
+# -*- coding: utf-8 -*-
+"""
+Smart Review Crawling  (v2)
+================================================================
+기존 'Review Search'의 후속 버전.
+
+핵심 변경점
+- Selenium 클릭 스크래핑 ❌  →  로그인된 세션으로 API(개발자 모드) 호출 ✅
+- 채널 5개: L(Klook), KK(KKday), GG(GetYourGuide), TPC(Ctrip/Trip.com), MRT(MyRealTrip)
+- 1~5점 리뷰 전부 수집
+- 전 지사(Area) 대상  (Seoul/Busan/Tokyo ...)
+- 결과: 화면 통계(지사→날짜 계층) + 엑셀 결과 저장 + 전체 Copy
+
+동작 방식(캡처-리플레이)
+- 각 채널 리뷰 페이지가 실제로 보내는 요청을 CDP 프리로드 훅으로 가로채고,
+  페이지네이션/날짜만 바꿔 그대로 재요청해서 리뷰를 수집한다.
+- 예약번호(Agency Code)로 매칭한다.
+  L=booking_no, KK=orderMid, GG=bookingReference, TPC=orderId, MRT=reservationNo
+
+실행 준비
+- 크롬을 디버그 모드로 실행 후 5개 채널에 로그인 (하단 안내 참고)
+================================================================
+"""
+
 import os
-import time
 import re
+import json
+import time
+import traceback
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta
+
 import pandas as pd
-from datetime import timedelta
-from tkinter import Tk, filedialog, Label, Button, Frame, StringVar, messagebox, Checkbutton, BooleanVar, Radiobutton
-from tkcalendar import DateEntry
+from tkinter import (
+    Tk, filedialog, Label, Button, Toplevel, StringVar, messagebox,
+    Frame, Scrollbar, Canvas, Checkbutton, BooleanVar, Text, Entry, Radiobutton
+)
+from tkinter.ttk import Progressbar, Checkbutton as TtkCheckbutton
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
 
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
-import calendar
+# 캘린더 위젯(선택): 있으면 DateEntry, 없으면 일반 Entry로 폴백
+try:
+    from tkcalendar import DateEntry
+    HAS_TKCAL = True
+except Exception:
+    DateEntry = None
+    HAS_TKCAL = False
 
+
+# =========================================================
+# 설정
+# =========================================================
 REQUIRED_COLS = ["Date", "Area", "Product", "Agency", "Agency Code", "Main Guide", "People"]
-AREAS = ['Seoul', 'Busan', 'Tokyo', 'Osaka', 'Nagoya', 'Fukuoka', 'Sapporo', 'Sydney', 'London']
 
-# 지역 그룹 (UI 선택용)
-REGION_AREAS = {
-    "KOREA": ["Seoul", "Busan"],
-    "JAPAN": ["Tokyo", "Osaka", "Nagoya", "Fukuoka", "Sapporo"],
-    "AUSTRALIA": ["Sydney"],
-    "UK": ["London"],
+# 조회 대상 채널(= 엑셀 Agency 컬럼 값).  값이 다르면 여기만 바꾸면 됨.
+CHANNELS = ["L", "KK", "GG", "TPC", "MRT"]
+
+CHANNEL_META = {
+    "L":   {"name": "KLOOK",        "page": "https://merchant.klook.com/reviews",
+            "endpoint": "review_list"},
+    "KK":  {"name": "KKDAY",        "page": "https://scm.kkday.com/v1/en/comment/index",
+            "endpoint": "get_comment_list"},
+    "GG":  {"name": "GetYourGuide", "page": "https://supplier.getyourguide.com/performance/reviews",
+            "endpoint": "/graphql", "body_contains": "bookingReference"},
+    "TPC": {"name": "Trip.com",     "page": "https://vbooking.ctrip.com/tour/comment_manage/comment/list?bizScene=ACTIVITY",
+            "endpoint": "listOrderComments"},
+    "MRT": {"name": "MyRealTrip",   "page": "https://partner.myrealtrip.com/reviews/touractivity",
+            "endpoint": "reviews/search"},
 }
 
-# =========================
-# KLOOK 옵션
-# =========================
-KLOOK_AUTO_DATE_DROPDOWN = True   # 드롭다운 (Participation time / Reviewed date) 자동 선택
-KLOOK_AUTO_DATE_FILTER = True
-KLOOK_AUTO_50_PER_PAGE = True
-KLOOK_PAGE_SIZE = 30
-KLOOK_MAX_PAGES = 500
+DEBUG_PORT = "127.0.0.1:9222"
 
-# KKDAY
-KKDAY_MAX_PAGES = 200
-KKDAY_WAIT = 10
+# 결과 저장 기준 = main.py 가 있는 폴더 (돌린 폴더)
+try:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    SCRIPT_DIR = os.getcwd()
 
-# =========================
-# GG (GetYourGuide) 옵션
-# =========================
-GG_URL = "https://supplier.getyourguide.com/performance/reviews"
-GG_WAIT = 10
-GG_MAX_PAGES = 500
+# 지사(Area)의 국가 그룹 & 표시 순서
+COUNTRY_GROUPS = [
+    ("한국", ["Seoul", "Busan"]),
+    ("일본", ["Tokyo", "Osaka", "Nagoya", "Fukuoka", "Sapporo"]),
+    ("호주", ["Sydney"]),
+    ("영국", ["London"]),
+]
+
+# 지사 영문 → 한글 시트명
+AREA_KR = {
+    "Seoul": "서울", "Busan": "부산", "Tokyo": "도쿄", "Osaka": "오사카",
+    "Nagoya": "나고야", "Fukuoka": "후쿠오카", "Sapporo": "삿포로",
+    "Sydney": "시드니", "London": "런던",
+}
+
+# 스페셜 카테고리 상품(리뷰 조회 대상 아님 → 결과/엑셀에서 제외). 공백제거·소문자 부분일치.
+SPECIAL_PRODUCT_KEYS = ["mbc스튜디오", "dr.petit", "마리엠헤어"]
 
 
-class ReviewCollectorNew:
+def area_rank(area):
+    a = str(area).strip().lower()
+    for ci, (c, areas) in enumerate(COUNTRY_GROUPS):
+        for ai, name in enumerate(areas):
+            if name.lower() == a:
+                return (ci, ai)
+    return (99, str(area))  # 미등록 지사는 맨 뒤, 이름순
+
+
+def area_country(area):
+    a = str(area).strip().lower()
+    for c, areas in COUNTRY_GROUPS:
+        if any(name.lower() == a for name in areas):
+            return c
+    return "기타"
+
+
+# =========================================================
+# 공통 유틸
+# =========================================================
+def norm_code(x):
+    """예약번호/코드를 안정적으로 문자열화 (큰 숫자/과학표기/끝 .0 처리) + 대문자/공백제거."""
+    s = str(x).strip()
+    if s.lower() in ["nan", "none", ""]:
+        return ""
+    s = s.lstrip("'")
+    m = re.match(r"^(\d+)\.0$", s)
+    if m:
+        s = m.group(1)
+    elif re.match(r"^\d+(\.\d+)?e[+-]?\d+$", s, flags=re.IGNORECASE):
+        try:
+            s = format(Decimal(s), "f").split(".")[0]
+        except (InvalidOperation, ValueError):
+            pass
+    return re.sub(r"\s+", "", s).upper()
+
+
+def to_epoch_ms(dt):
+    return int(pd.Timestamp(dt).timestamp() * 1000)
+
+
+# =========================================================
+# 메인 앱
+# =========================================================
+class PowerReviewApp:
     def __init__(self):
         self.root = Tk()
-        self.root.title("📋 리뷰 자동 수집기")
-        self.root.geometry("650x1080")
+        self.root.title("📋 Smart Review Crawling")
+        self.root.geometry("840x1340")
 
         self.driver = None
-        self.reservation_file = None
+        self.df = None
+        self.df_simple = None   # Monthly/NYP용 (스페셜+No Show 모두 포함)
+        self.mode_var = StringVar(value="PFP")   # PFP / MONTHLY / NYP
+        self._preload_id = None
 
-        # 4) 지역 선택 변수 (디폴트: KOREA)
-        self.region_korea_var = BooleanVar(value=True)
-        self.region_japan_var = BooleanVar(value=False)
-        self.region_aus_var = BooleanVar(value=False)
-        self.region_uk_var = BooleanVar(value=False)
+        # No Show
+        self.noshow_codes = set()
+        self.noshow_teams = 0
+        self.noshow_people = 0
 
-        # 5) agency 선택 변수
-        self.all_var = BooleanVar(value=True)
-        self.l_var = BooleanVar(value=True)
-        self.kk_var = BooleanVar(value=True)
-        self.gg_var = BooleanVar(value=True)
+        # 선택 체크박스 (날짜/지사/가이드)
+        self.date_vars = {}          # {Timestamp: BooleanVar}
+        self.select_all_dates = BooleanVar(value=True)
+        self.branch_vars = {}        # {area: BooleanVar}
+        self.select_all_branches = BooleanVar(value=True)
+        self.country_vars = {}     # {country: BooleanVar} (지사=국가 단위 선택)
+        self.guide_vars = {}         # {guide: BooleanVar}
+        self.select_all_guides = BooleanVar(value=True)
 
-        # 재생성 모드 변수
-        self.regen_excel_file = None
-        self.regen_reservation_file = None
-        self.use_reservation_var = BooleanVar(value=False)
+        self.detail_lines = []
+        self.last_report_text = ""
+        self._branch_texts = {}
 
         self.setup_ui()
 
-    # -------------------------
+    # ---------------------------------------------------------
     # UI
-    # -------------------------
+    # ---------------------------------------------------------
     def setup_ui(self):
-        self.last_output_file = None  # 마지막 저장된 엑셀 파일명
+        Label(self.root, text="📋 Smart Review Crawling", font=("Arial", 18, "bold")).pack(pady=12)
+        Label(self.root, text="API(개발자 모드) 방식 · L / KK / GG / TPC / MRT · 전 지사",
+              font=("Arial", 9), fg="#555").pack()
 
-        Label(self.root, text="📋 리뷰 자동 수집기", font=("Arial", 18, "bold")).pack(pady=15)
+        # 모드 선택 (PFP 성과제 / Monthly / New Year Party)
+        mf = Frame(self.root, relief="solid", borderwidth=1, padx=10, pady=6)
+        mf.pack(fill="x", padx=20, pady=(8, 0))
+        Label(mf, text="모드:", font=("Arial", 11, "bold")).pack(side="left", padx=(0, 6))
+        for _val, _txt in [("PFP", "PFP (1주일)"),
+                           ("MONTHLY", "Monthly (1달)"),
+                           ("QUARTERLY", "Quarterly (3달)"),
+                           ("NYP", "New Year Party (1년)")]:
+            Radiobutton(mf, text=_txt, variable=self.mode_var, value=_val,
+                        command=self._on_mode_change).pack(side="left", padx=8)
+        # 선택한 모드의 날짜 기준 표시 (지사→도시 표시처럼 동적)
+        _bf = Frame(self.root)
+        _bf.pack(fill="x", padx=22, pady=(0, 2))
+        self.mode_basis_var = StringVar(value="")
+        Label(_bf, textvariable=self.mode_basis_var, font=("Arial", 9), fg="#2196F3").pack(anchor="w")
 
-        # --- 모드 선택 ---
-        mode_frame = Frame(self.root, relief="solid", borderwidth=1, padx=10, pady=10)
-        mode_frame.pack(fill="x", padx=20, pady=(0, 10))
-
-        Label(mode_frame, text="🔧 작업 모드 선택", font=("Arial", 12, "bold")).pack(anchor="w")
-
-        # ✅ 3가지 모드: collect_review / collect_participation / regenerate
-        self.mode_var = StringVar(value="collect_review")
-
-        # 세로 배치 (3개라 가로배치하면 길어짐)
-        Radiobutton(mode_frame, text="리뷰 날짜 기준 수집",
-                    variable=self.mode_var, value="collect_review",
-                    command=self._on_mode_change, font=("Arial", 10)).pack(anchor="w", pady=2)
-
-        Radiobutton(mode_frame, text="참여 날짜 기준 수집",
-                    variable=self.mode_var, value="collect_participation",
-                    command=self._on_mode_change, font=("Arial", 10)).pack(anchor="w", pady=2)
-
-        Radiobutton(mode_frame, text="Guide 종합 재계산 및 재생성",
-                    variable=self.mode_var, value="regenerate",
-                    command=self._on_mode_change, font=("Arial", 10)).pack(anchor="w", pady=2)
-
-        # 각 모드별 컨테이너
-        self.collect_container = Frame(self.root)
-        self.regenerate_container = Frame(self.root)
-
-        # ============================================================
-        # 수집 모드 UI (리뷰 날짜 기준 / 참여 날짜 기준 공용)
-        # ============================================================
-
-        # 1. 날짜
-        frame1 = Frame(self.collect_container, relief="solid", borderwidth=1, padx=10, pady=10)
-        frame1.pack(fill="x", padx=20, pady=5)
-
-        Label(frame1, text="1️⃣ 수집 기간 선택", font=("Arial", 12, "bold")).pack(anchor="w")
-
-        date_frame = Frame(frame1)
-        date_frame.pack(fill="x", pady=5)
-
-        Label(date_frame, text="시작일:", font=("Arial", 10)).pack(side="left", padx=5)
-        self.start_date = DateEntry(date_frame, width=12, background='darkblue',
-                                    foreground='white', borderwidth=2, date_pattern='yyyy-mm-dd')
-        self.start_date.pack(side="left", padx=5)
-
-        Label(date_frame, text="종료일:", font=("Arial", 10)).pack(side="left", padx=5)
-        self.end_date = DateEntry(date_frame, width=12, background='darkblue',
-                                  foreground='white', borderwidth=2, date_pattern='yyyy-mm-dd')
-        self.end_date.pack(side="left", padx=5)
-
-        # 날짜 확인 버튼 (종료일 바로 옆)
-        self.confirmed_start = None
-        self.confirmed_end = None
-
-        Button(date_frame, text="✅ 확인", command=self._confirm_dates,
-               bg="#2196F3", fg="white", font=("Arial", 9, "bold"), padx=8).pack(side="left", padx=(10, 5))
-
-        # --- 상태 메시지 (아래 줄) ---
-        status_frame = Frame(frame1)
-        status_frame.pack(fill="x", pady=(3, 0))
-
-        self.date_status_label = Label(status_frame, text="", font=("Arial", 9), fg="gray")
-        self.date_status_label.pack(anchor="w", padx=5)
-
-        # --- 월별 분할 미리보기 (아래 줄) ---
-        kkday_preview_frame = Frame(frame1, relief="flat", padx=5, pady=1)
-        kkday_preview_frame.pack(fill="x", pady=(2, 0))
-
-        Label(kkday_preview_frame, text="📅 월별 조회 구간 (L/KK):", font=("Arial", 9), fg="#555555").pack(anchor="w")
-
-        self.kkday_chunks_label = Label(kkday_preview_frame, text="", font=("Arial", 9), fg="#2196F3", justify="left")
-        self.kkday_chunks_label.pack(anchor="w")
-
-        # 2. 크롬 연결
-        frame2 = Frame(self.collect_container, relief="solid", borderwidth=1, padx=10, pady=10)
-        frame2.pack(fill="x", padx=20, pady=5)
-
-        Label(frame2, text="2️⃣ 크롬 연결 (디버그 모드)", font=("Arial", 12, "bold")).pack(anchor="w")
-        Label(frame2, text="⚠️ L, KK, GG 로그인 필요", font=("Arial", 9), fg="red").pack(anchor="w")
-
+        # 1) 크롬 연결
+        f1 = Frame(self.root, relief="solid", borderwidth=1, padx=10, pady=10)
+        f1.pack(fill="x", padx=20, pady=6)
+        Label(f1, text="1️⃣ 크롬 연결 (디버그 모드)", font=("Arial", 12, "bold")).pack(anchor="w")
+        Label(f1, text="⚠️ L, KK, GG, TPC, MRT 모두 로그인 필요", font=("Arial", 9), fg="red").pack(anchor="w")
         self.chrome_status = StringVar(value="🔴 크롬 미연결")
-        Label(frame2, textvariable=self.chrome_status, font=("Arial", 10)).pack(anchor="w", pady=5)
+        Label(f1, textvariable=self.chrome_status, font=("Arial", 10)).pack(anchor="w", pady=4)
+        Button(f1, text="🔌 크롬 연결", command=self.connect_chrome,
+               width=20, bg="#4CAF50", fg="white").pack(anchor="w")
 
-        Button(frame2, text="🔌 크롬 연결", command=self.connect_chrome,
-               width=20, height=1, bg="#4CAF50", fg="white").pack(anchor="w")
-
-        # 3. 예약 파일 업로드
-        frame3 = Frame(self.collect_container, relief="solid", borderwidth=1, padx=10, pady=10)
-        frame3.pack(fill="x", padx=20, pady=5)
-
-        Label(frame3, text="3️⃣ 예약 리스트 업로드", font=("Arial", 12, "bold")).pack(anchor="w")
-
+        # 2) 엑셀 선택
+        f2 = Frame(self.root, relief="solid", borderwidth=1, padx=10, pady=10)
+        f2.pack(fill="x", padx=20, pady=6)
+        Label(f2, text="2️⃣ 틴트 리포트 엑셀 선택", font=("Arial", 12, "bold")).pack(anchor="w")
         self.file_status = StringVar(value="📁 파일 미선택")
-        Label(frame3, textvariable=self.file_status, font=("Arial", 10)).pack(anchor="w", pady=5)
+        Label(f2, textvariable=self.file_status, font=("Arial", 10)).pack(anchor="w", pady=4)
+        Button(f2, text="📁 파일 선택", command=self.select_file,
+               width=20, bg="#2196F3", fg="white").pack(anchor="w")
 
-        Button(frame3, text="📁 파일 선택", command=self.select_file,
-               width=20, height=1, bg="#2196F3", fg="white").pack(anchor="w")
+        # 3) 날짜  (PFP=체크박스 / Monthly·NYP=기간 캘린더)  4) 지사  5) 가이드
+        def _scroll_section(parent, title, height):
+            fr = Frame(parent, relief="solid", borderwidth=1, padx=10, pady=6)
+            fr.pack(fill="both", expand=True, padx=0, pady=0)
+            top = Frame(fr); top.pack(fill="x")
+            Label(top, text=title, font=("Arial", 11, "bold")).pack(side="left", anchor="w")
+            cf = Frame(fr); cf.pack(fill="both", expand=True)
+            cv = Canvas(cf, height=height)
+            sb = Scrollbar(cf, orient="vertical", command=cv.yview)
+            inner = Frame(cv)
+            inner.bind("<Configure>", lambda e, c=cv: c.configure(scrollregion=c.bbox("all")))
+            cv.create_window((0, 0), window=inner, anchor="nw")
+            cv.configure(yscrollcommand=sb.set)
+            cv.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            return fr, top, inner
 
-        # 4. 지역 선택 UI
-        frame4 = Frame(self.collect_container, relief="solid", borderwidth=1, padx=10, pady=10)
-        frame4.pack(fill="x", padx=20, pady=5)
+        # 날짜 컨테이너 (모드에 따라 체크박스/기간 스왑)
+        self.date_container = Frame(self.root)
+        self.date_container.pack(fill="x", padx=20, pady=4)
 
-        Label(frame4, text="4️⃣ 지역 선택", font=("Arial", 12, "bold")).pack(anchor="w")
-        Label(frame4, text="※ 체크된 지역의 시트만 생성됩니다.", font=("Arial", 9), fg="gray").pack(anchor="w")
+        # (A) PFP용: 날짜 체크박스
+        self.date_cb_section, d_top, self.date_frame = _scroll_section(self.date_container, "3️⃣ 날짜", 175)
+        Checkbutton(d_top, text="전체", variable=self.select_all_dates,
+                    command=self.toggle_all_dates).pack(side="right")
 
-        region_line = Frame(frame4)
-        region_line.pack(anchor="w", pady=5)
+        # (B) Monthly/NYP용: 기간(시작일~종료일, 캘린더 선택)
+        self.date_range_section = Frame(self.date_container, relief="solid", borderwidth=1, padx=10, pady=8)
+        Label(self.date_range_section, text="3️⃣ 기간 (엑셀에서 자동 감지 · 수정 가능)",
+              font=("Arial", 11, "bold")).pack(anchor="w")
+        _rr = Frame(self.date_range_section); _rr.pack(fill="x", pady=6)
+        Label(_rr, text="시작일:", font=("Arial", 10)).pack(side="left", padx=(0, 4))
+        self.start_date_widget = self._mk_date(_rr); self.start_date_widget.pack(side="left", padx=(0, 14))
+        Label(_rr, text="종료일:", font=("Arial", 10)).pack(side="left", padx=(0, 4))
+        self.end_date_widget = self._mk_date(_rr); self.end_date_widget.pack(side="left")
+        if not HAS_TKCAL:
+            Label(self.date_range_section,
+                  text="※ 달력 위젯이 없어 텍스트 입력(YYYY-MM-DD)입니다. 'pip install tkcalendar' 하면 달력이 떠요.",
+                  font=("Arial", 8), fg="#888").pack(anchor="w")
 
-        Checkbutton(region_line, text="KOREA (Seoul, Busan)", variable=self.region_korea_var).pack(anchor="w")
-        Checkbutton(region_line, text="JAPAN (Tokyo, Osaka, Nagoya, Fukuoka, Sapporo)", variable=self.region_japan_var).pack(anchor="w")
-        Checkbutton(region_line, text="AUSTRALIA (Sydney)", variable=self.region_aus_var).pack(anchor="w")
-        Checkbutton(region_line, text="UK (London)", variable=self.region_uk_var).pack(anchor="w")
+        # 4) 지사 = 국가 단위 가로 선택
+        bf = Frame(self.root, relief="solid", borderwidth=1, padx=10, pady=8)
+        bf.pack(fill="x", padx=20, pady=4)
+        Label(bf, text="4️⃣ 지사 (국가 선택)", font=("Arial", 11, "bold")).pack(anchor="w")
+        self.country_row = Frame(bf)
+        self.country_row.pack(fill="x", pady=3)
+        self.branch_cities_var = StringVar(value="")
+        Label(bf, textvariable=self.branch_cities_var, font=("Arial", 9), fg="#555",
+              justify="left", wraplength=760).pack(anchor="w")
 
-        # 5. 에이전시 선택 UI
-        frame5 = Frame(self.collect_container, relief="solid", borderwidth=1, padx=10, pady=10)
-        frame5.pack(fill="x", padx=20, pady=5)
+        # 5) 가이드 (PFP 전용 · Monthly/NYP는 전체 가이드라 숨김)
+        self.guide_section, g_top, self.guide_frame = _scroll_section(self.root, "5️⃣ 가이드 (체크한 가이드만 · 팀/명)", 150)
+        Checkbutton(g_top, text="전체", variable=self.select_all_guides,
+                    command=self.toggle_all_guides).pack(side="right")
 
-        Label(frame5, text="5️⃣ 에이전시 선택", font=("Arial", 12, "bold")).pack(anchor="w")
-        Label(frame5, text="※ 체크된 에이전시만 수집/엑셀 출력됩니다.", font=("Arial", 9), fg="gray").pack(anchor="w")
+        # 실행
+        self.run_button = Button(self.root, text="▶️ 리뷰 조회 시작",
+               command=self._run_dispatch, height=2,
+               bg="#FF9800", fg="white", font=("Arial", 11, "bold"))
+        self.run_button.pack(fill="x", padx=20, pady=8)
 
-        Checkbutton(frame5, text="전체선택", variable=self.all_var, command=self.on_toggle_all).pack(anchor="w")
-
-        agencies_line = Frame(frame5)
-        agencies_line.pack(anchor="w", pady=5)
-
-        Checkbutton(agencies_line, text="L", variable=self.l_var, command=self.on_toggle_individual).pack(side="left", padx=10)
-        Checkbutton(agencies_line, text="KK", variable=self.kk_var, command=self.on_toggle_individual).pack(side="left", padx=10)
-        Checkbutton(agencies_line, text="GG", variable=self.gg_var, command=self.on_toggle_individual).pack(side="left", padx=10)
-
-        Button(self.collect_container, text="🚀 리뷰 자동 수집 시작",
-               command=self.start_collection,
-               width=30, height=2,
-               bg="#FF9800", fg="white",
-               font=("Arial", 11, "bold")).pack(pady=15)
+        # 결과
+        rf = Frame(self.root, relief="solid", borderwidth=1, padx=10, pady=10)
+        rf.pack(fill="both", expand=True, padx=20, pady=6)
+        hdr = Frame(rf)
+        hdr.pack(fill="x")
+        Label(hdr, text="📊 조회 결과 (지사 → 날짜)", font=("Arial", 12, "bold")).pack(side="left", anchor="w")
+        Button(hdr, text="전체", command=self._search_clear, width=5).pack(side="right", padx=2)
+        Button(hdr, text="🔍 검색", command=self._search_guide, width=7).pack(side="right", padx=2)
+        self.search_var = StringVar()
+        _se = Entry(hdr, textvariable=self.search_var, width=16)
+        _se.pack(side="right", padx=2)
+        _se.bind("<Return>", lambda e: self._search_guide())
+        _se.bind("<KeyRelease>", lambda e: self._search_guide())
+        Label(hdr, text="가이드 검색:", font=("Arial", 9)).pack(side="right", padx=(0, 3))
+        rsf = Frame(rf)
+        rsf.pack(fill="both", expand=True)
+        rsb = Scrollbar(rsf)
+        rsb.pack(side="right", fill="y")
+        self.result_text = Text(rsf, height=18, width=70, yscrollcommand=rsb.set,
+                                font=("Consolas", 9), wrap="none")
+        self.result_text.pack(side="left", fill="both", expand=True)
+        rsb.config(command=self.result_text.yview)
 
         self.progress_var = StringVar(value="")
-        Label(self.collect_container, textvariable=self.progress_var, font=("Arial", 9)).pack(pady=5)
+        Label(self.root, textvariable=self.progress_var, font=("Arial", 9)).pack(pady=3)
 
-        # ============================================================
-        # 재생성 모드 UI
-        # ============================================================
+        Label(self.root, text="💾 엑셀 자동 저장됨", font=("Arial", 9), fg="#4CAF50").pack()
+        self.copy_btn_frame = Frame(self.root)
+        self.copy_btn_frame.pack(pady=5)
+        self._build_copy_buttons()
 
-        # 1) 리뷰 엑셀 파일 선택
-        regen_frame1 = Frame(self.regenerate_container, relief="solid", borderwidth=1, padx=10, pady=10)
-        regen_frame1.pack(fill="x", padx=20, pady=5)
+        self._result_df = None  # 마지막 결과 df (엑셀 저장용)
+        self._on_mode_change()   # 초기 모드(PFP) 화면 반영
 
-        Label(regen_frame1, text="1️⃣ 리뷰 엑셀 파일 선택", font=("Arial", 12, "bold")).pack(anchor="w")
-        Label(regen_frame1, text="※ 엑셀 파일에서 리뷰를 수정한 후 Guide 시트를 다시 계산합니다.", font=("Arial", 9), fg="gray").pack(anchor="w")
-
-        self.regen_excel_status = StringVar(value="📁 파일 미선택")
-        Label(regen_frame1, textvariable=self.regen_excel_status, font=("Arial", 10)).pack(anchor="w", pady=5)
-
-        Button(regen_frame1, text="📁 파일 선택", command=self.select_excel_for_regenerate,
-               width=20, height=1, bg="#2196F3", fg="white").pack(anchor="w")
-
-        # 2) 예약 파일 선택 (옵션)
-        regen_frame2 = Frame(self.regenerate_container, relief="solid", borderwidth=1, padx=10, pady=10)
-        regen_frame2.pack(fill="x", padx=20, pady=5)
-
-        Label(regen_frame2, text="2️⃣ 예약 리스트 선택", font=("Arial", 12, "bold")).pack(anchor="w")
-        Label(regen_frame2, text="※ Guide 계산에 예약 리스트(투어/팀/가이드 집계)가 사용됩니다.", font=("Arial", 9), fg="gray").pack(anchor="w")
-        Label(regen_frame2, text="※ 예약 파일을 선택하지 않으면 기존 Guide의 Tour/Team Count를 유지하고 Review Count/%만 갱신합니다.",
-              font=("Arial", 9), fg="gray").pack(anchor="w")
-
-        self.use_reservation_cb = Checkbutton(regen_frame2, text="예약 리스트 사용", variable=self.use_reservation_var,
-                                              command=self._on_toggle_use_reservation)
-        self.use_reservation_cb.pack(anchor="w", pady=(5, 3))
-
-        self.regen_reservation_status = StringVar(value="(미사용)")
-        self.regen_reservation_label = Label(regen_frame2, textvariable=self.regen_reservation_status, font=("Arial", 10), fg="gray")
-        self.regen_reservation_label.pack(anchor="w", pady=5)
-
-        self.regen_pick_res_btn = Button(regen_frame2, text="📁 파일 선택", command=self.select_reservation_for_regenerate,
-                                         width=20, height=1, bg="#2196F3", fg="white", state="disabled")
-        self.regen_pick_res_btn.pack(anchor="w")
-
-        # 실행 버튼
-        Button(self.regenerate_container, text="🔄 Guide 시트 재생성 실행",
-               command=self.execute_regenerate,
-               width=30, height=2,
-               bg="#FF9800", fg="white",
-               font=("Arial", 11, "bold")).pack(pady=15)
-
-        self.regen_progress_var = StringVar(value="")
-        Label(self.regenerate_container, textvariable=self.regen_progress_var,
-              font=("Arial", 9)).pack(pady=5)
-
-        self._on_mode_change()
-
-    def _on_toggle_use_reservation(self):
-        """예약 리스트 사용 체크박스 토글"""
-        if self.use_reservation_var.get():
-            self.regen_pick_res_btn.config(state="normal")
-            if self.regen_reservation_file:
-                self.regen_reservation_status.set(f"✅ {os.path.basename(self.regen_reservation_file)}")
-                self.regen_reservation_label.config(fg="black")
-            else:
-                self.regen_reservation_status.set("📁 파일 미선택")
-                self.regen_reservation_label.config(fg="black")
-        else:
-            self.regen_pick_res_btn.config(state="disabled")
-            self.regen_reservation_file = None
-            self.regen_reservation_status.set("(미사용)")
-            self.regen_reservation_label.config(fg="gray")
-
-    # -------------------------
-    # Agency UI Logic
-    # -------------------------
-    def on_toggle_all(self):
-        val = self.all_var.get()
-        self.l_var.set(val)
-        self.kk_var.set(val)
-        self.gg_var.set(val)
-
-    def on_toggle_individual(self):
-        all_checked = self.l_var.get() and self.kk_var.get() and self.gg_var.get()
-        self.all_var.set(all_checked)
-
-    def get_selected_agencies(self):
-        selected = []
-        if self.l_var.get():
-            selected.append("L")
-        if self.kk_var.get():
-            selected.append("KK")
-        if self.gg_var.get():
-            selected.append("GG")
-        return selected
-
-    def get_selected_areas(self):
-        areas = []
-        if self.region_korea_var.get():
-            areas.extend(REGION_AREAS.get("KOREA", []))
-        if self.region_japan_var.get():
-            areas.extend(REGION_AREAS.get("JAPAN", []))
-        if self.region_aus_var.get():
-            areas.extend(REGION_AREAS.get("AUSTRALIA", []))
-        if self.region_uk_var.get():
-            areas.extend(REGION_AREAS.get("UK", []))
-        seen = set()
-        out = []
-        for a in areas:
-            if a not in seen:
-                out.append(a)
-                seen.add(a)
-        return out
-
-    def _on_mode_change(self):
-        """모드 전환 시 해당 컨테이너만 표시"""
-        mode = self.mode_var.get()
-
-        self.collect_container.pack_forget()
-        self.regenerate_container.pack_forget()
-
-        if mode in ("collect_review", "collect_participation"):
-            self.collect_container.pack(fill="both", expand=True)
-        elif mode == "regenerate":
-            self.regenerate_container.pack(fill="both", expand=True)
-
-    def select_excel_for_regenerate(self):
-        """재생성할 엑셀 파일 선택"""
-        file_path = filedialog.askopenfilename(
-            title="리뷰 엑셀 파일 선택",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
-        )
-        if file_path:
-            self.regen_excel_file = file_path
-            filename = os.path.basename(file_path)
-            self.regen_excel_status.set(f"✅ {filename}")
-            print(f"📁 리뷰 엑셀 선택: {filename}")
-
-    def select_reservation_for_regenerate(self):
-        """재생성에 사용할 예약 파일 선택"""
-        file_path = filedialog.askopenfilename(
-            title="예약 리스트 선택",
-            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
-        )
-        if file_path:
-            self.regen_reservation_file = file_path
-            filename = os.path.basename(file_path)
-            self.regen_reservation_status.set(f"✅ {filename}")
-            self.regen_reservation_label.config(fg="black")
-            print(f"📁 예약 파일 선택: {filename}")
-
-    def execute_regenerate(self):
-        """Guide 시트 재생성 실행"""
-        if not self.regen_excel_file:
-            messagebox.showerror("오류", "리뷰 엑셀 파일을 선택하세요!")
-            return
-
-        if not os.path.exists(self.regen_excel_file):
-            messagebox.showerror("오류", f"리뷰 엑셀 파일을 찾을 수 없습니다:\n{self.regen_excel_file}")
-            return
-
-        use_res = self.use_reservation_var.get()
-
-        if use_res:
-            if not self.regen_reservation_file:
-                messagebox.showerror("오류", "예약 리스트 사용이 체크되어 있습니다.\n예약 파일을 선택하세요!")
-                return
-            if not os.path.exists(self.regen_reservation_file):
-                messagebox.showerror("오류", f"예약 파일을 찾을 수 없습니다:\n{self.regen_reservation_file}")
-                return
-
-        self.regen_progress_var.set("처리 중...")
-        self.root.update()
-
+    def log(self, msg=""):
         try:
-            wb = load_workbook(self.regen_excel_file)
-
-            review_sheets = [name for name in wb.sheetnames if name != "Guide"]
-            matched_df = self._read_reviews_from_workbook(wb, review_sheets)
-
-            if matched_df.empty:
-                wb.close()
-                messagebox.showwarning("경고", "리뷰 데이터가 없습니다.")
-                self.regen_progress_var.set("")
-                return
-
-            if use_res:
-                reservation_df = pd.read_excel(self.regen_reservation_file)
-                reservation_df.columns = reservation_df.columns.str.strip()
-                reservation_df['Date'] = pd.to_datetime(reservation_df['Date'], errors='coerce')
-
-                areas_to_make = review_sheets
-
-                self.create_guide_sheet_original_style_openpyxl(wb, matched_df, reservation_df, areas_to_make)
-                wb.save(self.regen_excel_file)
-                wb.close()
-
-                self.regen_progress_var.set("완료!")
-                messagebox.showinfo("완료", f"Guide 시트 재생성 완료!\n\n파일: {os.path.basename(self.regen_excel_file)}")
-                return
-
-            ok = self.update_guide_review_only_keep_team_tour(wb, matched_df)
-            wb.save(self.regen_excel_file)
-            wb.close()
-
-            if not ok:
-                self.regen_progress_var.set("완료(일부)")
-                messagebox.showwarning("완료", "Review Count/% 업데이트는 완료했지만, 일부 영역/가이드 매칭이 누락됐을 수 있습니다.\n(Guide 시트 포맷이 예상과 다르면 발생)")
-            else:
-                self.regen_progress_var.set("완료!")
-                messagebox.showinfo("완료", f"Guide 시트 업데이트 완료!\n(Team/Tour 유지 + Review Count/% 갱신)\n\n파일: {os.path.basename(self.regen_excel_file)}")
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.regen_progress_var.set("오류 발생")
-            messagebox.showerror("오류", f"Guide 처리 실패:\n{e}")
-
-    # -------------------------
-    # 날짜 Confirm
-    # -------------------------
-    def _confirm_dates(self):
-        """확인 버튼 클릭 → 현재 DateEntry 값을 확정하고 미리보기 갱신."""
-        try:
-            s = self.start_date.get_date()
-            e = self.end_date.get_date()
-            if s > e:
-                self.date_status_label.config(text="⚠ 시작일이 종료일보다 큼", fg="red")
-                self.kkday_chunks_label.config(text="", fg="#555555")
-                return
-
-            self.confirmed_start = s
-            self.confirmed_end = e
-            self.date_status_label.config(
-                text=f"✔ {s.strftime('%Y-%m-%d')} ~ {e.strftime('%Y-%m-%d')} 확정",
-                fg="#4CAF50"
-            )
-            self._update_kkday_preview()
-        except Exception as ex:
-            self.date_status_label.config(text=f"오류: {ex}", fg="red")
-
-    def _update_kkday_preview(self):
-        """확정된 날짜로 KKDAY 월별 분할 미리보기 갱신."""
-        try:
-            if not self.confirmed_start or not self.confirmed_end:
-                self.kkday_chunks_label.config(text="", fg="#555555")
-                return
-
-            chunks = self._split_into_monthly_chunks(self.confirmed_start, self.confirmed_end)
-
-            if len(chunks) == 1:
-                self.kkday_chunks_label.config(text="(1개 구간 — 분할 불필요)", fg="#888888")
-            else:
-                lines = " / ".join(f"{cs.strftime('%m/%d')}~{ce.strftime('%m/%d')}" for cs, ce in chunks)
-                self.kkday_chunks_label.config(text=f"{len(chunks)}개 구간: {lines}", fg="#2196F3")
+            line = str(msg)
+            print(line)
+            self.detail_lines.append(line)
+            if getattr(self, "result_text", None) is not None:
+                self.result_text.insert("end", line + "\n")
+                self.result_text.see("end")
+                self.root.update_idletasks()
         except Exception:
-            self.kkday_chunks_label.config(text="", fg="#555555")
+            pass
 
-    # -------------------------
-    # Chrome / File
-    # -------------------------
+    # ---------------------------------------------------------
+    # 크롬 연결
+    # ---------------------------------------------------------
     def connect_chrome(self):
         try:
             options = Options()
-            options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+            options.add_experimental_option("debuggerAddress", DEBUG_PORT)
             self.driver = webdriver.Chrome(options=options)
+            self.driver.set_script_timeout(60)
             self.chrome_status.set("🟢 크롬 연결됨")
-            messagebox.showinfo("성공", "크롬 연결 성공!\n\nL, KK, GG에 로그인했는지 확인하세요.")
-            print("✅ 크롬 연결 성공")
+            messagebox.showinfo("성공", "크롬 연결 성공!\n\nL, KK, GG, TPC, MRT 로그인 상태를 확인하세요.")
         except Exception as e:
             self.chrome_status.set("🔴 크롬 연결 실패")
             messagebox.showerror(
                 "연결 실패",
-                f"크롬 연결 실패: {e}\n\n다음 명령어로 크롬을 실행하세요:\n\n"
+                f"크롬 연결 실패: {e}\n\n크롬을 디버그 모드로 먼저 실행하세요:\n\n"
                 'Windows:\n"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
-                '--remote-debugging-port=9222 --user-data-dir="C:\\Chrome_debug_temp"'
+                '--remote-debugging-port=9222 --user-data-dir="C:\\Chrome_debug"\n\n'
+                'Mac:\n/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome '
+                '--remote-debugging-port=9222'
             )
 
-    def select_file(self):
-        file_path = filedialog.askopenfilename(
-            title="예약 리스트 선택",
-            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
-        )
-        if file_path:
-            self.reservation_file = file_path
-            filename = os.path.basename(file_path)
-            self.file_status.set(f"✅ {filename}")
-            print(f"📁 예약 파일 선택: {filename}")
+    # ---------------------------------------------------------
+    # 엑셀 로딩 + No Show
+    # ---------------------------------------------------------
+    def load_excel_with_noshow(self, file_path):
+        xls = pd.read_excel(file_path, sheet_name=None)
 
-    # -------------------------
-    # Main (Collect)
-    # -------------------------
-    def start_collection(self):
+        # No Show 시트 탐색
+        noshow_sheet = None
+        for name in xls.keys():
+            nm = str(name).strip().lower()
+            if nm in ["no show", "noshow", "no_show", "no-show"] or "no show" in nm:
+                noshow_sheet = name
+                break
+
+        # 메인 시트 = No Show 제외 첫 시트
+        main_sheet = None
+        for name in xls.keys():
+            if name == noshow_sheet:
+                continue
+            main_sheet = name
+            break
+        if main_sheet is None:
+            raise ValueError("메인 데이터 시트를 찾을 수 없습니다.")
+
+        df = xls[main_sheet].copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        missing = [c for c in REQUIRED_COLS if c not in df.columns]
+        if missing:
+            raise ValueError(f"필수 컬럼 누락: {missing}")
+
+        df["Agency Code"] = df["Agency Code"].apply(norm_code)
+
+        # No Show 코드 수집
+        noshow_codes = set()
+        if noshow_sheet is not None:
+            ns = xls[noshow_sheet].copy()
+            ns.columns = [str(c).strip() for c in ns.columns]
+            code_col = None
+            for c in ns.columns:
+                lc = c.lower()
+                if lc in ["agency code", "booking code", "booking", "order", "order id",
+                          "reservation", "reservation code"] or ("code" in lc and code_col is None):
+                    code_col = c
+            flag_col = None
+            for c in ns.columns:
+                lc = c.lower().replace(" ", "")
+                if lc in ["noshow", "no_show", "no-show"] or ("show" in lc and flag_col is None):
+                    flag_col = c
+            if code_col is not None:
+                for _, r in ns.iterrows():
+                    code = norm_code(r.get(code_col, ""))
+                    if not code:
+                        continue
+                    if flag_col is not None:
+                        if str(r.get(flag_col, "")).strip().upper() == "O":
+                            noshow_codes.add(code)
+                    else:
+                        row_text = " ".join(str(v) for v in r.values).upper()
+                        if " O " in f" {row_text} " or row_text.strip() == "O":
+                            noshow_codes.add(code)
+
+        # 메인 시트에 No Show 컬럼이 있으면 함께 반영
+        noshow_main_col = None
+        for c in df.columns:
+            norm = re.sub(r"[\s\-_]", "", str(c).strip().lower())
+            if norm in ["noshow", "noshow(o)"] or ("no" in norm and "show" in norm):
+                noshow_main_col = c
+                break
+        if noshow_main_col is not None:
+            flags = df[noshow_main_col].astype(str).str.strip().str.upper()
+            add = set(df.loc[flags == "O", "Agency Code"].apply(norm_code).tolist())
+            noshow_codes |= {c for c in add if c}
+
+        return df, noshow_codes, main_sheet, noshow_sheet
+
+    def select_file(self):
         if not self.driver:
             messagebox.showerror("오류", "먼저 크롬을 연결하세요!")
             return
-
-        if not self.reservation_file:
-            messagebox.showerror("오류", "예약 리스트를 업로드하세요!")
+        path = filedialog.askopenfilename(
+            title="틴트 리포트 엑셀 선택",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")])
+        if not path:
             return
-
-        selected_agencies = self.get_selected_agencies()
-        selected_areas = self.get_selected_areas()
-        if not selected_areas:
-            messagebox.showerror("오류", "지역을 최소 1개 이상 선택하세요! (KOREA/JAPAN/AUSTRALIA/UK)")
-            return
-
-        if not selected_agencies:
-            messagebox.showerror("오류", "에이전시를 최소 1개 이상 선택하세요! (L/KK/GG)")
-            return
-
-        start_date = self.confirmed_start if self.confirmed_start else self.start_date.get_date()
-        end_date = self.confirmed_end if self.confirmed_end else self.end_date.get_date()
-        if start_date > end_date:
-            messagebox.showerror("오류", "시작일이 종료일보다 늦습니다!")
-            return
-
-        # ✅ 모드별 date_mode 결정
-        mode = self.mode_var.get()
-        date_mode = "review_date" if mode == "collect_review" else "participation"
-        mode_name = "리뷰 날짜 기준" if date_mode == "review_date" else "참여 날짜 기준"
-
-        print(f"\n{'=' * 80}")
-        print(f"🚀 리뷰 수집 시작 ({mode_name})")
-        print(f"📅 기간: {start_date} ~ {end_date}")
-        print(f"🏷 선택 에이전시: {selected_agencies}")
-        print(f"🗺 선택 지역: {selected_areas}")
-        print(f"{'=' * 80}\n")
-
-        self.progress_var.set(f"처리 중... ({mode_name})")
-        self.root.update()
-
         try:
-            print("📂 예약 파일 로드 중...")
-            reservation_df = pd.read_excel(self.reservation_file)
-            reservation_df.columns = reservation_df.columns.str.strip()
+            df, noshow_codes, main_sheet, noshow_sheet = self.load_excel_with_noshow(path)
 
-            missing = [c for c in REQUIRED_COLS if c not in reservation_df.columns]
-            if missing:
-                raise ValueError(f"예약 파일에 필수 컬럼이 없습니다: {missing}")
+            df = df[df["Main Guide"].notna() & (df["Main Guide"].astype(str).str.strip() != "")].copy()
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df[df["Date"].notna()].copy()
+            df["Area"] = df["Area"].astype(str).str.strip()
+            df["Agency"] = df["Agency"].astype(str).str.strip().str.upper()
+            df["Agency Code"] = df["Agency Code"].astype(str).str.strip()
+            df["People"] = pd.to_numeric(df["People"], errors="coerce").fillna(0).astype(int)
 
-            reservation_df['Date'] = pd.to_datetime(reservation_df['Date'], errors='coerce')
-            period_df = reservation_df[
-                (reservation_df['Date'].dt.date >= start_date) &
-                (reservation_df['Date'].dt.date <= end_date)
-            ].copy()
+            # 스페셜 카테고리 마스크 (MBC 스튜디오/Dr.Petit/마리엠헤어)
+            _pn = df["Product"].astype(str).str.replace(r"\s+", "", regex=True).str.lower()
+            special_mask = _pn.apply(lambda x: any(k in x for k in SPECIAL_PRODUCT_KEYS))
 
-            if period_df.empty:
-                messagebox.showwarning("경고", "선택한 기간에 예약이 없습니다!")
-                return
+            # Monthly/NYP용: No Show 포함 · 스페셜 카테고리 제외
+            self.df_simple = df[~special_mask].copy()
 
-            period_df['Agency'] = period_df['Agency'].astype(str).str.strip()
-            period_df['Agency Code'] = period_df['Agency Code'].astype(str).str.strip()
-            period_df = period_df[period_df['Agency'].isin(selected_agencies)].copy()
-
-            period_df['Area'] = period_df['Area'].astype(str).str.strip()
-            period_df = period_df[period_df['Area'].isin(selected_areas)].copy()
-
-            if period_df.empty:
-                messagebox.showwarning("경고", f"선택한 기간 내 (에이전시={selected_agencies}, 지역={selected_areas}) 예약이 없습니다!")
-                return
-
-            print(f"✅ 기간 내 예약(선택 에이전시): {len(period_df)}개\n")
-
-            # ✅ date_mode 전달
-            all_reviews = self.collect_all_reviews(
-                start_date, end_date,
-                enabled_agencies=selected_agencies,
-                date_mode=date_mode
-            )
-
-            output_file = self.create_excel_output_reviews_only(
-                period_df=period_df,
-                all_reviews=all_reviews,
-                start_date=start_date,
-                end_date=end_date,
-                selected_areas=selected_areas,
-                date_mode=date_mode
-            )
-
-            print(f"\n{'=' * 80}")
-            print("✅ 수집 완료!")
-            print(f"📥 파일 저장: {output_file}")
-            print(f"{'=' * 80}")
-
-            self.last_output_file = output_file
-            self.progress_var.set("완료!")
-            messagebox.showinfo("완료", f"리뷰 수집 완료! ({mode_name})\n\n파일 저장 위치:\n{output_file}")
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.progress_var.set("오류 발생")
-            messagebox.showerror("오류", f"처리 중 오류 발생:\n{e}")
-
-    # -------------------------
-    # Collect All (선택된 에이전시만)
-    # -------------------------
-    def collect_all_reviews(self, start_date, end_date, enabled_agencies, date_mode="participation"):
-        all_reviews = {'L': {}, 'KK': {}, 'GG': {}}
-
-        if "L" in enabled_agencies:
-            print(f"\n🔍 KLOOK(L) 리뷰 수집 중... (mode={date_mode})")
-            klook_reviews = self.collect_klook_reviews_two_stars(
-                start_date, end_date, stars=[5, 4], date_mode=date_mode
-            )
-            all_reviews['L'].update(klook_reviews)
-            print(f"✅ KLOOK(L): 총 {len(all_reviews['L'])}개\n")
-        else:
-            print("\n⏭ KLOOK(L) 스킵 (체크 안됨)")
-
-        if "KK" in enabled_agencies:
-            print(f"🔍 KKDAY(KK) 리뷰 수집 중... (mode={date_mode})")
-            kk_reviews = self.collect_kkday_reviews_range(
-                start_date, end_date, date_mode=date_mode
-            )
-            all_reviews['KK'].update(kk_reviews)
-            print(f"✅ KK: 총 {len(all_reviews['KK'])}개\n")
-        else:
-            print("⏭ KK 스킵 (체크 안됨)")
-
-        if "GG" in enabled_agencies:
-            print(f"🔍 GetYourGuide(GG) 리뷰 수집 중... (mode={date_mode})")
-            gg_reviews = self.collect_gg_reviews(
-                start_date, end_date, date_mode=date_mode
-            )
-            all_reviews['GG'].update(gg_reviews)
-            print(f"✅ GG: 총 {len(all_reviews['GG'])}개\n")
-        else:
-            print("⏭ GG 스킵 (체크 안됨)")
-
-        return all_reviews
-
-    # ============================================================
-    # KLOOK
-    # ============================================================
-    def collect_klook_reviews_two_stars(self, start_date, end_date, stars=(5, 4), date_mode="participation"):
-        reviews = {}
-        chunks = self._split_into_monthly_chunks(start_date, end_date)
-
-        print(f"  📅 KLOOK 월 분할: {len(chunks)}개 청크")
-        for i, (chunk_start, chunk_end) in enumerate(chunks, 1):
-            print(f"\n  🔄 KLOOK 청크 {i}/{len(chunks)}: {chunk_start} ~ {chunk_end}")
-            self._klook_collect_single_month(chunk_start, chunk_end, stars, reviews, date_mode=date_mode)
-            print(f"  ✅ 청크 {i} 완료 (누적 {len(reviews)}개)")
-
-        return reviews
-
-    def _klook_collect_single_month(self, start_date, end_date, stars, reviews, date_mode="participation"):
-        self.driver.get("https://merchant.klook.com/reviews")
-        time.sleep(2)
-
-        # ✅ 모드별 드롭다운 옵션 분기
-        if KLOOK_AUTO_DATE_DROPDOWN:
-            if date_mode == "review_date":
-                self._klook_set_date_dropdown("Reviewed date")
+            # No Show 제외 (PFP 성과제 전용)
+            self.noshow_codes = {str(c).strip() for c in noshow_codes if str(c).strip()}
+            if self.noshow_codes:
+                mask = df["Agency Code"].isin(self.noshow_codes)
+                self.noshow_teams = int(mask.sum())
+                self.noshow_people = int(df.loc[mask, "People"].sum())
+                df = df[~mask].copy()
             else:
-                self._klook_set_date_dropdown("Participation time")
+                self.noshow_teams = 0
+                self.noshow_people = 0
 
-        if KLOOK_AUTO_DATE_FILTER:
-            ok = self._klook_apply_date_filter(start_date, end_date)
-            if not ok:
-                return reviews
+            # 스페셜 카테고리 상품 제외 (PFP 성과제용)
+            self.df = df[~special_mask.loc[df.index]].copy()
+            self.input_path = path
 
-        if KLOOK_AUTO_50_PER_PAGE:
-            self._klook_ensure_page_size(KLOOK_PAGE_SIZE)
+            branches = sorted(df["Area"].unique().tolist())
+            ns_msg = ""
+            if self.noshow_teams:
+                ns_msg = f" | No Show(O) {self.noshow_teams}팀 {self.noshow_people}명 (PFP만 제외 · Monthly/NYP는 포함)"
+            self.file_status.set(
+                f"✅ {len(df)}건 · 지사 {len(branches)}개({', '.join(branches[:6])}{'...' if len(branches)>6 else ''}){ns_msg}")
 
-        for star in stars:
-            print(f"  ⭐ {star}점 필터 수집 시작")
-
-            if not self._klook_select_star_filter(star):
-                print(f"    ⚠ {star}점 필터 선택 실패(스킵)")
-                continue
-
-            self._klook_wait_table_ready()
-
-            self._klook_go_first_page()
-            self._klook_wait_table_ready()
-
-            added = self._klook_collect_all_pages_into(reviews, star=star)
-            print(f"  ✅ {star}점: {added}개 추가(누적 {len(reviews)}개)\n")
-
-        return reviews
-
-    def _klook_wait_table_ready(self):
-        try:
-            WebDriverWait(self.driver, 15).until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="klook-content"]//table/tbody/tr'))
-            )
-        except:
-            pass
-        time.sleep(0.6)
-
-    def _klook_set_date_dropdown(self, option_text):
-        """KLOOK 드롭다운에서 옵션 선택 (Participation time 또는 Reviewed date)"""
-        try:
-            product_dropdown = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH,
-                    '//*[@id="klook-content"]/div/div[1]/div[1]/div/div[1]/form[2]/div[1]/div[2]/div/span'
-                ))
-            )
-            product_dropdown.click()
-            time.sleep(0.5)
-
-            wait = WebDriverWait(self.driver, 10)
-            opt = wait.until(EC.element_to_be_clickable(
-                (By.XPATH, f'//li[contains(text(), "{option_text}")]')
-            ))
-            opt.click()
-            time.sleep(0.5)
-
-            print(f"  ✅ KLOOK '{option_text}' 선택 완료")
-            return True
-
-        except TimeoutException:
-            print(f"  ⚠ KLOOK '{option_text}' 옵션을 찾지 못해 시간 초과되었습니다.")
-            return False
-        except Exception as e:
-            print(f"  ⚠ KLOOK '{option_text}' 선택 실패: {e}")
-            return False
-
-    def _klook_apply_date_filter(self, start_date, end_date):
-        try:
-            start_str = start_date.strftime("%Y-%m-%d")
-            end_str = end_date.strftime("%Y-%m-%d")
-
-            main_input = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH,
-                                            '//*[@id="klook-content"]/div/div[1]/div[1]/div/div[1]/form[2]/div[2]/div[2]/div/span/span/span/input[1]'
-                                            ))
-            )
-            main_input.click()
-            time.sleep(0.7)
-
-            popup_start_input = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located(
-                    (By.XPATH, '/html/body/div[3]/div/div/div/div/div[1]/div[1]/div[1]/div/input'))
-            )
-            popup_start_input.click()
-            popup_start_input.send_keys(Keys.CONTROL + 'a')
-            popup_start_input.send_keys(start_str)
-            time.sleep(0.2)
-
-            popup_end_input = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located(
-                    (By.XPATH, '/html/body/div[3]/div/div/div/div/div[1]/div[2]/div[1]/div/input'))
-            )
-            popup_end_input.click()
-            popup_end_input.send_keys(Keys.CONTROL + 'a')
-            popup_end_input.send_keys(end_str)
-            time.sleep(0.2)
-
-            print(f"  ✅ 날짜 필터 설정: {start_str} ~ {end_str}")
-
-            search_btn = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, '//*[@id="klook-content"]/div/div[1]/div[1]/div/div[2]/button[1]'))
-            )
-            search_btn.click()
-            time.sleep(3)
-            return True
-        except Exception as e:
-            print(f"  ⚠ KLOOK 날짜 필터/Search 실패: {e}")
-            return False
-
-    def _klook_get_current_page_size(self):
-        candidates = [
-            (By.CSS_SELECTOR, ".ant-pagination-options-size-changer .ant-select-selection-item"),
-            (By.CSS_SELECTOR, ".ant-pagination-options-size-changer .ant-select-selector"),
-            (By.XPATH,
-             '//div[contains(@class,"ant-pagination-options-size-changer")]//*[contains(@class,"ant-select-selection-item")]'),
-        ]
-        for by, sel in candidates:
+            self.build_date_checkboxes()
+            self.build_branch_checkboxes()
+            self.build_guide_checkboxes()
+            # Monthly/NYP 기간(캘린더) 자동 채움
             try:
-                el = self.driver.find_element(by, sel)
-                txt = (el.text or "").strip()
-                m = re.search(r'(\d+)\s*/\s*page', txt)
-                if m:
-                    return int(m.group(1))
-            except:
-                continue
-        return None
+                self._set_date(self.start_date_widget, self.df_simple["Date"].min())
+                self._set_date(self.end_date_widget, self.df_simple["Date"].max())
+            except Exception:
+                pass
+        except Exception as e:
+            messagebox.showerror("오류", f"파일 읽기 실패:\n{e}")
 
-    def _klook_ensure_page_size(self, size=50):
-        cur = self._klook_get_current_page_size()
-        if cur == size:
-            print(f"  ✅ KLOOK {size}/page 이미 적용됨")
-            return True
+    def build_date_checkboxes(self):
+        for w in self.date_frame.winfo_children():
+            w.destroy()
+        self.date_vars = {}
+        for d in sorted(self.df["Date"].dt.normalize().unique()):
+            ts = pd.Timestamp(d)
+            sub = self.df[self.df["Date"].dt.normalize() == ts]
+            var = BooleanVar(value=True)
+            self.date_vars[ts] = var
+            TtkCheckbutton(
+                self.date_frame,
+                text=f"{ts.strftime('%Y-%m-%d (%a)')}  ·  {len(sub)}팀 {int(sub['People'].sum())}명",
+                variable=var, command=self._on_filter_change
+            ).pack(anchor="w", padx=5, pady=1)
 
-        ok = self._klook_set_page_size(size)
-        for _ in range(6):
+    def build_branch_checkboxes(self):
+        for w in self.country_row.winfo_children():
+            w.destroy()
+        self.country_vars = {}
+        order = [c for c, _ in COUNTRY_GROUPS] + ["기타"]
+        present = []
+        for area in self.df["Area"].unique():
+            c = area_country(area)
+            if c not in present:
+                present.append(c)
+        present.sort(key=lambda c: order.index(c) if c in order else 99)
+        for c in present:
+            n = self.df[self.df["Area"].apply(area_country) == c]
+            var = BooleanVar(value=True)
+            self.country_vars[c] = var
+            TtkCheckbutton(self.country_row, text=f"{c} ({len(n)}팀)",
+                           variable=var, command=self._on_branch_change).pack(side="left", padx=10)
+        self._update_branch_cities()
+
+    def _update_branch_cities(self):
+        areas = sorted(self._selected_branches(), key=area_rank)
+        self.branch_cities_var.set("지사: " + (", ".join(areas) if areas else "(국가를 선택하세요)"))
+
+    def _on_branch_change(self):
+        self._update_branch_cities()
+        self.build_guide_checkboxes()
+
+    def build_guide_checkboxes(self):
+        if not hasattr(self, "guide_frame"):
+            return
+        for w in self.guide_frame.winfo_children():
+            w.destroy()
+        prev = {g: v.get() for g, v in self.guide_vars.items()}
+        self.guide_vars = {}
+        dsel = self._selected_dates()
+        bsel = self._selected_branches()
+        if not dsel or not bsel:
+            Label(self.guide_frame, text="(날짜·지사(국가)를 먼저 선택하세요)", fg="#888").pack(anchor="w", padx=5)
+            return
+        sub = self.df[self.df["Date"].dt.normalize().isin(dsel) & self.df["Area"].isin(bsel)]
+        if sub.empty:
+            Label(self.guide_frame, text="(선택 조건에 가이드 없음)", fg="#888").pack(anchor="w", padx=5)
+            return
+        rows = []
+        for guide, g in sub.groupby("Main Guide"):
+            areas = sorted(g["Area"].unique(), key=area_rank)
+            pa = areas[0]
+            rows.append((area_rank(pa), pa, str(guide), len(g), int(g["People"].sum())))
+        rows.sort(key=lambda t: (t[0], t[2]))  # 지사(국가)순 → 가이드 ㄱㄴㄷ
+        for _rank, pa, guide, teams, people in rows:
+            var = BooleanVar(value=prev.get(guide, True))
+            self.guide_vars[guide] = var
+            TtkCheckbutton(
+                self.guide_frame,
+                text=f"{guide}  ·  {teams}팀 {people}명   [{pa}]",
+                variable=var
+            ).pack(anchor="w", padx=5, pady=1)
+
+    def _selected_dates(self):
+        return [ts for ts, var in self.date_vars.items() if var.get()]
+
+    def _selected_branches(self):
+        if self.df is None or not self.country_vars:
+            return []
+        sel_c = [c for c, v in self.country_vars.items() if v.get()]
+        return [a for a in self.df["Area"].unique() if area_country(a) in sel_c]
+
+    def _on_filter_change(self):
+        # 날짜/지사 선택이 바뀌면 가이드 목록/카운트 갱신
+        self.build_guide_checkboxes()
+
+    def toggle_all_dates(self):
+        v = self.select_all_dates.get()
+        for var in self.date_vars.values():
+            var.set(v)
+        self.build_guide_checkboxes()
+
+    def toggle_all_branches(self):
+        for var in self.country_vars.values():
+            var.set(self.select_all_branches.get())
+        self._on_branch_change()
+
+    def toggle_all_guides(self):
+        v = self.select_all_guides.get()
+        for var in self.guide_vars.values():
+            var.set(v)
+
+    # ---------------------------------------------------------
+    # 모드 전환 & 날짜 위젯 (Monthly/NYP 기간 캘린더)
+    # ---------------------------------------------------------
+    def _on_mode_change(self):
+        m = self.mode_var.get()
+        if getattr(self, "mode_basis_var", None) is not None:
+            self.mode_basis_var.set("↳ 참여일 기준" if m == "PFP" else "↳ 리뷰 작성일 기준")
+        self.date_cb_section.pack_forget()
+        self.date_range_section.pack_forget()
+        self.guide_section.pack_forget()
+        if m == "PFP":
+            self.date_cb_section.pack(fill="both", expand=True)
+            self.guide_section.pack(fill="both", expand=True, padx=20, pady=4, before=self.run_button)
+        else:
+            self.date_range_section.pack(fill="x")
+
+    def _mk_date(self, parent):
+        if HAS_TKCAL:
+            return DateEntry(parent, width=12, date_pattern="yyyy-mm-dd",
+                             background="#2196F3", foreground="white", borderwidth=2)
+        return Entry(parent, width=14)
+
+    def _set_date(self, w, value):
+        try:
+            d = pd.Timestamp(value).date()
+        except Exception:
+            return
+        if HAS_TKCAL and hasattr(w, "set_date"):
+            try:
+                w.set_date(d)
+            except Exception:
+                pass
+        else:
+            try:
+                w.delete(0, "end"); w.insert(0, d.strftime("%Y-%m-%d"))
+            except Exception:
+                pass
+
+    def _get_date(self, w):
+        if HAS_TKCAL and hasattr(w, "get_date"):
+            return w.get_date()
+        try:
+            return pd.Timestamp(str(w.get()).strip()).date()
+        except Exception:
+            return None
+
+    # ---------------------------------------------------------
+    # 캡처-리플레이 엔진
+    # ---------------------------------------------------------
+    def _clear_preload(self):
+        if self._preload_id is not None:
+            try:
+                self.driver.execute_cdp_cmd(
+                    "Page.removeScriptToEvaluateOnNewDocument",
+                    {"identifier": self._preload_id})
+            except Exception:
+                pass
+            self._preload_id = None
+
+    def capture_request(self, page_url, endpoint, body_contains="", wait=8):
+        """CDP 프리로드 훅으로 페이지가 보내는 실제 요청(url/method/headers/body)을 캡처."""
+        self._clear_preload()
+        hook = """
+        (function(){
+          window.__CAP__ = null;
+          var WANT = %s;
+          var NEED = %s;
+          function save(url, method, headers, body){
+            try{
+              if(String(url).indexOf(WANT) >= 0
+                 && (!NEED || (body && String(body).indexOf(NEED) >= 0))
+                 && !window.__CAP__){
+                window.__CAP__ = {url:String(url), method:(method||'GET'), headers:(headers||{}), body:(body||null)};
+              }
+            }catch(e){}
+          }
+          var of = window.fetch;
+          window.fetch = function(){
+            var a = arguments;
+            try{
+              var url = (a[0] && a[0].url) || a[0];
+              var m = (a[1] && a[1].method) || (a[0] && a[0].method) || 'GET';
+              var h = {};
+              var hs = (a[1] && a[1].headers) || (a[0] && a[0].headers);
+              if(hs){ if(hs instanceof Headers){ hs.forEach(function(v,k){h[k]=v;}); } else { for(var k in hs){h[k]=hs[k];} } }
+              var b = (a[1] && a[1].body) || null;
+              if(a[0] instanceof Request && !b){ a[0].clone().text().then(function(t){ save(url,m,h,t); }); }
+              else { save(url,m,h,b); }
+            }catch(e){}
+            return of.apply(this, a);
+          };
+          var O = XMLHttpRequest.prototype.open,
+              S = XMLHttpRequest.prototype.send,
+              SR = XMLHttpRequest.prototype.setRequestHeader;
+          XMLHttpRequest.prototype.open = function(m,u){ this.__m=m; this.__u=u; this.__h={}; return O.apply(this, arguments); };
+          XMLHttpRequest.prototype.setRequestHeader = function(k,v){ this.__h[k]=v; return SR.apply(this, arguments); };
+          XMLHttpRequest.prototype.send = function(b){ save(this.__u, this.__m, this.__h, b); return S.apply(this, arguments); };
+        })();
+        """ % (json.dumps(endpoint), json.dumps(body_contains or ""))
+
+        res = self.driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument", {"source": hook})
+        self._preload_id = res.get("identifier")
+
+        self.driver.get(page_url)
+        deadline = time.time() + wait
+        cap = None
+        while time.time() < deadline:
+            cap = self.driver.execute_script("return window.__CAP__ || null;")
+            if cap:
+                break
             time.sleep(0.4)
-            cur2 = self._klook_get_current_page_size()
-            if cur2 == size:
-                print(f"  ✅ KLOOK {size}/page 설정 완료")
-                return True
+        return cap
 
-        print(f"  ⚠ KLOOK {size}/page 설정 확인 실패(현재: {self._klook_get_current_page_size()})")
-        return ok
+    def _fetch_page(self, js, *args):
+        """execute_async_script 래퍼 (한 페이지 요청).
+        주의: 내부 async 함수 안에서는 바깥 arguments 를 볼 수 없으므로,
+        인자를 P[] 배열로, 콜백을 done 으로 클로저 캡처해서 넘긴다.
+        각 채널 js 는 P[0], P[1] ... 로 인자에 접근한다."""
+        wrapper = ("var done = arguments[arguments.length-1];\n"
+                   "var P = Array.prototype.slice.call(arguments, 0, arguments.length-1);\n"
+                   "(async function(){ try{\n" + js +
+                   "\n}catch(e){ done({error:String(e)}); } })();")
+        return self.driver.execute_async_script(wrapper, *args)
 
-    def _klook_set_page_size(self, size=50):
-        try:
-            size_changer = WebDriverWait(self.driver, 8).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, ".ant-pagination-options-size-changer"))
-            )
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", size_changer)
-            time.sleep(0.2)
-            size_changer.click()
-            time.sleep(0.6)
-
-            opt_xpath = f'//li[@role="option" and contains(normalize-space(.), "{size} / page")]'
-            opt = WebDriverWait(self.driver, 8).until(EC.element_to_be_clickable((By.XPATH, opt_xpath)))
-            self.driver.execute_script("arguments[0].click();", opt)
-            time.sleep(1.0)
-
-            self._klook_wait_table_ready()
-            return True
-        except Exception as e:
-            print(f"  ⚠ KLOOK {size}/page 설정 실패: {e}")
-            return False
-
-    def _klook_select_star_filter(self, star: int):
-        try:
-            if star == 5:
-                xp = '//*[@id="klook-content"]/div/div[1]/div[2]/div[1]/div/div[6]'
-            elif star == 4:
-                xp = '//*[@id="klook-content"]/div/div[1]/div[2]/div[1]/div/div[5]'
-            else:
-                xp = f'//div[contains(@data-track-event, "Star Filter Selected|{star}")]'
-
-            el = WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable((By.XPATH, xp)))
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            time.sleep(0.2)
-            self.driver.execute_script("arguments[0].click();", el)
-            time.sleep(1.0)
-            return True
-        except Exception as e:
-            print(f"    ⚠ 별점 {star} 클릭 실패: {e}")
-            return False
-
-    def _klook_go_first_page(self):
-        try:
-            first = self.driver.find_element(By.CSS_SELECTOR, "li.ant-pagination-item-1")
-            cls = first.get_attribute("class") or ""
-            if "ant-pagination-item-active" in cls:
-                return
-            a = first.find_element(By.XPATH, ".//a")
-            self.driver.execute_script("arguments[0].click();", a)
-            time.sleep(1.0)
-        except:
-            pass
-
-    def _klook_get_active_page_number(self):
-        try:
-            active = self.driver.find_element(By.CSS_SELECTOR, "li.ant-pagination-item-active")
-            return int((active.text or "").strip())
-        except:
-            return None
-
-    def _klook_click_next_and_wait(self, prev_page_num):
-        for _ in range(3):
-            try:
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(0.3)
-
-                next_li = self.driver.find_element(By.XPATH, '//li[contains(@class,"ant-pagination-next")]')
-                cls = next_li.get_attribute("class") or ""
-                if "ant-pagination-disabled" in cls:
-                    time.sleep(0.8)
-                    cls2 = next_li.get_attribute("class") or ""
-                    if "ant-pagination-disabled" in cls2:
-                        return False
-
-                try:
-                    clickable = next_li.find_element(By.XPATH, './/a|.//button')
-                except:
-                    clickable = next_li
-
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", clickable)
-                time.sleep(0.2)
-                self.driver.execute_script("arguments[0].click();", clickable)
-
-                WebDriverWait(self.driver, 12).until(
-                    lambda d: (self._klook_get_active_page_number() is not None) and
-                              (self._klook_get_active_page_number() > prev_page_num)
-                )
-                self._klook_wait_table_ready()
-                return True
-            except TimeoutException:
-                time.sleep(1.0)
-                continue
-            except:
-                time.sleep(0.8)
-                continue
-        return False
-
-    def _klook_extract_reviewed_on(self, text):
-        if not text:
-            return "", ""
-        m = re.search(r'reviewed\s+on\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})', text, flags=re.I)
-        if not m:
-            return "", ""
-        dt_str = f"{m.group(1)} {m.group(2)}"
-        tz = ""
-        tz_m = re.search(r'\((GMT[+-]\d+)\)', text, flags=re.I)
-        if tz_m:
-            tz = f"({tz_m.group(1)})"
-        return dt_str, tz
-
-    def _klook_clean_review_text(self, text):
-        if not text:
-            return ""
-        text = re.sub(r'reviewed\s+on\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*(\([^)]+\))?', '', text, flags=re.I)
-        text = re.sub(r'\n{2,}', '\n', text).strip()
-        return text.strip()
-
-    def _normalize_date_only(self, s):
-        if not s:
-            return ""
-        s = str(s).strip()
-        s = re.sub(r'^reviewed\s+on\s+', '', s, flags=re.I).strip()
-        m = re.search(r'(\d{4}-\d{2}-\d{2})', s)
-        return m.group(1) if m else ""
-
-    def _klook_get_col_map(self):
-        col_map = {}
-        try:
-            ths = self.driver.find_elements(By.XPATH, '//*[@id="klook-content"]//table/thead/tr/th')
-            for idx, th in enumerate(ths, start=1):
-                txt = (th.text or "").strip()
-                if not txt:
-                    try:
-                        txt = (th.get_attribute("innerText") or "").strip()
-                    except:
-                        txt = ""
-                norm = re.sub(r'\s+', ' ', txt).strip().lower()
-                if norm:
-                    col_map[norm] = idx
-        except:
-            pass
-        return col_map
-
-    def _klook_pick_col(self, col_map, candidates):
-        for c in candidates:
-            c_norm = re.sub(r'\s+', ' ', c).strip().lower()
-            if c_norm in col_map:
-                return col_map[c_norm]
-        for c in candidates:
-            c_norm = re.sub(r'\s+', ' ', c).strip().lower()
-            for k, v in col_map.items():
-                if c_norm in k:
-                    return v
-        return None
-
-    def _klook_collect_all_pages_into(self, reviews_dict, star=0):
-        total_added = 0
-        current_page = self._klook_get_active_page_number() or 1
-        guard = 0
-
-        col_map = self._klook_get_col_map()
-        reviewed_col = self._klook_pick_col(col_map, ["reviewed date", "review date", "reviewed time", "review time"])
-        stars_col = self._klook_pick_col(col_map, ["stars", "star", "rating"])
-        content_col = self._klook_pick_col(col_map, ["review content", "review content (text)", "review content text", "review"])
-
-        while guard < KLOOK_MAX_PAGES:
-            guard += 1
-
-            rows = self.driver.find_elements(By.XPATH, '//*[@id="klook-content"]//table/tbody/tr')
-            if not rows:
-                self._klook_wait_table_ready()
-                rows = self.driver.find_elements(By.XPATH, '//*[@id="klook-content"]//table/tbody/tr')
-                if not rows:
-                    break
-
-            page_added = 0
-            for row in rows:
-                try:
-                    code = row.find_element(By.XPATH, './td[1]/a').text.strip()
-                    if not code:
-                        continue
-
-                    tds = row.find_elements(By.XPATH, "./td")
-                    td_texts = [(td.text or "").strip() for td in tds]
-
-                    review_date = ""
-                    if reviewed_col and reviewed_col <= len(tds):
-                        review_date = self._normalize_date_only((tds[reviewed_col - 1].text or "").strip())
-
-                    if not review_date:
-                        for t in td_texts:
-                            dt_str, _tz = self._klook_extract_reviewed_on(t)
-                            if dt_str:
-                                review_date = self._normalize_date_only(dt_str)
-                                break
-
-                    rating = ""
-                    if stars_col and stars_col <= len(tds):
-                        rating = (tds[stars_col - 1].text or "").strip()
-
-                    if rating:
-                        m = re.search(r'([0-5])', rating)
-                        rating = m.group(1) if m else ""
-
-                    if not rating:
-                        rating = str(star)
-
-                    review_text_raw = ""
-                    if content_col and content_col <= len(tds):
-                        review_text_raw = (tds[content_col - 1].text or "").strip()
-
-                    if content_col and reviewed_col and content_col == reviewed_col:
-                        review_text_raw = ""
-                    if content_col and stars_col and content_col == stars_col:
-                        review_text_raw = ""
-
-                    if review_text_raw:
-                        if re.fullmatch(r"\d{4}-\d{2}-\d{2}(\s+\d{2}:\d{2}(:\d{2})?)?", review_text_raw):
-                            review_text_raw = ""
-                        if len(review_text_raw) <= 6 and re.fullmatch(r"[0-9\s\-/:\.]+", review_text_raw):
-                            review_text_raw = ""
-
-                    if not review_text_raw:
-                        candidates = []
-                        for t in td_texts:
-                            if not t:
-                                continue
-                            if code in t:
-                                continue
-                            if t.strip() == rating:
-                                continue
-                            candidates.append(t)
-                        review_text_raw = max(candidates, key=len) if candidates else ""
-
-                    review_text = self._klook_clean_review_text(review_text_raw)
-
-                    reviews_dict[code] = {
-                        'rating': rating,
-                        'text': review_text,
-                        'review_date': review_date,
-                        'star_filter': str(star)
-                    }
-                    page_added += 1
-                except:
-                    continue
-
-            total_added += page_added
-            print(f"    페이지 {current_page}: {page_added}개 수집 (누적추가 {total_added}개)")
-
-            prev = current_page
-            if not self._klook_click_next_and_wait(prev):
-                break
-
-            current_page = self._klook_get_active_page_number() or (prev + 1)
-            try:
-                col_map = self._klook_get_col_map()
-                reviewed_col = self._klook_pick_col(col_map, ["reviewed date", "review date", "reviewed time", "review time"])
-                stars_col = self._klook_pick_col(col_map, ["stars", "star", "rating"])
-                content_col = self._klook_pick_col(col_map, ["review content", "review content (text)", "review content text", "review"])
-            except:
-                pass
-
-        return total_added
-
-    # ============================================================
-    # KKDAY
-    # ============================================================
-    @staticmethod
-    def _split_into_monthly_chunks(start_date, end_date):
-        chunks = []
-        cur = start_date
-        while cur <= end_date:
-            last_day = end_date.__class__(cur.year, cur.month, calendar.monthrange(cur.year, cur.month)[1])
-            chunk_end = min(last_day, end_date)
-            chunks.append((cur, chunk_end))
-            if cur.month == 12:
-                cur = end_date.__class__(cur.year + 1, 1, 1)
-            else:
-                cur = end_date.__class__(cur.year, cur.month + 1, 1)
-        return chunks
-
-    def collect_kkday_reviews_range(self, start_date, end_date, date_mode="participation"):
+    # ---------------------------------------------------------
+    # 채널별 수집기  →  {정규화 예약번호: rating(str)}
+    # ---------------------------------------------------------
+    def collect_klook(self, min_ms, date_set=None):
         reviews = {}
-        chunks = self._split_into_monthly_chunks(start_date, end_date)
-
-        print(f"  📅 KKDAY 월 분할: {len(chunks)}개 청크")
-        for i, (chunk_start, chunk_end) in enumerate(chunks, 1):
-            print(f"\n  🔄 KKDAY 청크 {i}/{len(chunks)}: {chunk_start} ~ {chunk_end}")
-            self._kkday_collect_single_month(chunk_start, chunk_end, reviews, date_mode=date_mode)
-            print(f"  ✅ 청크 {i} 완료 (누적 {len(reviews)}개)")
-
-        return reviews
-
-    def _kkday_collect_single_month(self, start_date, end_date, reviews, date_mode="participation"):
-        self.driver.get("https://scm.kkday.com/v1/en/comment/index")
-        time.sleep(2)
-
-        self._kkday_click_reset()
-
-        # ✅ 모드별 분기: Release date(리뷰) vs Departure date(참여)
-        if date_mode == "review_date":
-            ok = self._kkday_set_release_date_range(start_date, end_date)
-        else:
-            ok = self._kkday_set_departure_date_range(start_date, end_date)
-
-        if not ok:
-            print(f"  ❌ KKDAY 날짜 선택 실패 (mode={date_mode})")
+        cap = self.capture_request(CHANNEL_META["L"]["page"], "review_list", wait=10)
+        if not cap:
+            self.log("  ⚠ [L] 요청 캡처 실패 (로그인/페이지 확인)")
             return reviews
-
-        self._kkday_set_rating_4_5_only()
-        self._kkday_click_search()
-
-        sig = self._kkday_get_filter_signature()
-
-        page = 1
-        while page <= KKDAY_MAX_PAGES:
-            if not self._kkday_wait_results_ready():
-                print("  ⚠ KKDAY 결과가 안 보임 → 필터 복구 후 Search 재시도")
-                self._kkday_restore_filters_and_search(start_date, end_date, sig, date_mode=date_mode)
-                if not self._kkday_wait_results_ready():
-                    print("  ❌ 복구 후에도 결과 없음(로그인/권한/셀렉터 확인 필요)")
-                    break
-
-            self._kkday_click_all_show_original()
-
-            new_count, seen_count = self._kkday_collect_current_page_cards(reviews)
-            print(f"  페이지 {page}: 신규 {new_count}개 / 화면 {seen_count}개 (누적 {len(reviews)}개)")
-
-            if not self._kkday_go_next_page():
+        js = """
+        var cap=P[0], page=P[1], limit=P[2];
+        var u=new URL(cap.url, location.origin);
+        u.searchParams.set('page', String(page));
+        u.searchParams.set('limit', String(limit));
+        var res=await fetch(u.toString(), {credentials:'include', headers:(cap.headers||{})});
+        var j=await res.json();
+        var list=(j.result&&j.result.review_list)||j.review_list||[];
+        var total=(j.result&&j.result.total)||null;
+        done({rows:list.map(function(x){return {code:x.booking_no, rating:x.stars, rdate:x.review_time, pdate:x.participant_time};}), total:total});
+        """
+        page, limit, guard = 1, 30, 0
+        while page <= 200:
+            r = self._fetch_page(js, cap, page, limit)
+            if not r or r.get("error"):
+                self.log(f"  ⚠ [L] p{page} 오류: {r.get('error') if r else 'no-resp'}")
                 break
-
-            if self._kkday_filters_look_reset(sig):
-                print("  ⚠ 다음 페이지에서 필터가 풀린 것처럼 보임(결과 유지면 무시, 결과 없으면 자동 복구)")
-
+            rows = r.get("rows") or []
+            if not rows:
+                break
+            oldest_ok = True
+            for x in rows:
+                code = norm_code(x.get("code"))
+                d = (x.get("pdate") or "")[:10]
+                if code and (not date_set or d in date_set):
+                    reviews[code] = self._fmt_rating(x.get("rating"))
+                if not self._within(x.get("rdate"), min_ms):
+                    oldest_ok = False
+            self.log(f"  → [L] p{page}: {len(rows)}건 (기간내 누적 {len(reviews)})")
+            if not oldest_ok:   # 리뷰작성일이 기간보다 과거 → 그만
+                self.log("  → [L] 종료: 기간 이전 리뷰 도달")
+                break
             page += 1
-            time.sleep(0.8)
-
+            guard += 1
+            if guard > 200:
+                break
+            time.sleep(0.15)
         return reviews
 
-    def _kkday_click_reset(self):
+    def collect_kkday(self, min_dt, max_dt):
+        reviews = {}
+        cap = self.capture_request(CHANNEL_META["KK"]["page"], "get_comment_list", wait=10)
+        if not cap or not cap.get("body"):
+            self.log("  ⚠ [KK] 요청 캡처 실패 (로그인/페이지 확인)")
+            return reviews
+        beg = pd.Timestamp(min_dt).strftime("%Y-%m-%d")
+        end = pd.Timestamp(max_dt).strftime("%Y-%m-%d")
+        js = """
+        var cap=P[0], page=P[1], size=P[2], beg=P[3], end=P[4];
+        var body={};
+        try{ body=JSON.parse(cap.body)||{}; }catch(e){}
+        body.begGoDate=beg; body.endGoDate=end;
+        body.begRecDate=''; body.endRecDate='';   // release date 비움 (필수)
+        body.currentPage=page; body.pageSize=size;
+        var st=0, j={};
+        try{
+          var res=await fetch(cap.url, {method:'POST', credentials:'include',
+              headers:Object.assign({}, cap.headers||{}, {'Content-Type':'application/json'}),
+              body:JSON.stringify(body)});
+          st=res.status; try{ j=await res.json(); }catch(e){ j={__parse:String(e)}; }
+        }catch(e){ j={__fetch:String(e)}; }
+        var rl=(j&&j.data&&j.data.recommandList)||[];
+        var total=(j&&j.data&&(j.data.size!==undefined?j.data.size:null));
+        var dbg=null;
+        if(!rl.length){ dbg={status:st, keys:Object.keys(j||{}),
+            msg:(j&&(j.msg||j.__parse||j.__fetch))||null,
+            dataKeys:(j&&j.data)?Object.keys(j.data):null}; }
+        done({rows:rl.map(function(x){return {code:x.orderMid, rating:x.recScore, id:x.recOid};}),
+              total:total, dbg:dbg});
+        """
+        page, size, seen, total = 1, 50, set(), None
+        while page <= 300:
+            r = self._fetch_page(js, cap, page, size, beg, end)
+            if not r or r.get("error"):
+                self.log(f"  ⚠ [KK] p{page} 오류: {r.get('error') if r else 'no-resp'}")
+                break
+            if total is None:
+                total = r.get("total")
+            rows = r.get("rows") or []
+            if not rows:
+                if page == 1 and r.get("dbg"):
+                    self.log(f"  🔎 [KK] 응답: {r.get('dbg')}")
+                break
+            for x in rows:
+                key = x.get("id") or x.get("code")
+                if key in seen:
+                    continue
+                seen.add(key)
+                code = norm_code(x.get("code"))
+                if code:
+                    reviews[code] = self._fmt_rating(x.get("rating"))
+            self.log(f"  → [KK] p{page}: {len(rows)}건 (누적 {len(reviews)}"
+                     + (f" / {total}" if total else "") + ")")
+            if total and len(seen) >= total:
+                self.log("  → [KK] 종료: 전체 수집 완료")
+                break
+            if len(rows) < size:
+                self.log("  → [KK] 종료: 페이지 끝")
+                break
+            page += 1
+            time.sleep(0.15)
+        return reviews
+
+    def collect_ctrip(self, min_ms, wfrom, wto):
+        reviews = {}
+        cap = self.capture_request(CHANNEL_META["TPC"]["page"], "listOrderComments", wait=10)
+        if not cap:
+            self.log("  ⚠ [TPC] 요청 캡처 실패")
+            return reviews
+        js = """
+        var cap=P[0], page=P[1], size=P[2];
+        var body={sceneInfo:{bizScene:'ACTIVITY'}, paging:{pageNo:page, pageSize:size},
+                  sorting:{orderBy:'COMMENT_TIME', desc:true}};
+        try{ var b=JSON.parse(cap.body); if(b&&b.sceneInfo){ body.sceneInfo=b.sceneInfo; } }catch(e){}
+        var res=await fetch(cap.url, {method:'POST', credentials:'include',
+            headers:Object.assign({}, cap.headers||{}, {'Content-Type':'application/json'}),
+            body:JSON.stringify(body)});
+        var j=await res.json();
+        var list=j.comments||[];
+        done({rows:list.map(function(x){
+              var cd=''; if(x.commentTime){ try{ cd=new Date(x.commentTime).toISOString().slice(0,10); }catch(e){} }
+              return {code:String(x.orderId), rating:x.score, rdate:x.commentTime, cdate:cd};
+        }), total:j.totalCount||null});
+        """
+        page, size, anon_ratings = 1, 50, []
+        while page <= 300:
+            r = self._fetch_page(js, cap, page, size)
+            if not r or r.get("error"):
+                self.log(f"  ⚠ [TPC] p{page} 오류: {r.get('error') if r else 'no-resp'}")
+                break
+            rows = r.get("rows") or []
+            if not rows:
+                break
+            oldest_ok = True
+            for x in rows:
+                code = norm_code(x.get("code"))
+                d = (x.get("cdate") or "")[:10]   # 리뷰작성일 기준
+                keep = bool(d) and (wfrom <= d <= wto)   # 투어시작일 ~ 조회일
+                if keep and code == "0":
+                    anon_ratings.append(self._fmt_rating(x.get("rating")))  # 익명(주문번호 없음)
+                if code and code != "0" and keep:
+                    reviews[code] = self._fmt_rating(x.get("rating"))
+                if not self._within(x.get("rdate"), min_ms):
+                    oldest_ok = False
+            self.log(f"  → [TPC] p{page}: {len(rows)}건 (기간내 매칭가능 {len(reviews)})")
+            if not oldest_ok:
+                self.log("  → [TPC] 종료: 기간 이전 리뷰 도달")
+                break
+            page += 1
+            time.sleep(0.12)
+        if anon_ratings:
+            self.log(f"  · [TPC] 익명 리뷰(주문번호 없음) {len(anon_ratings)}건 (매칭 제외, 전체품질엔 포함)")
+        return reviews, anon_ratings
+
+    def collect_mrt(self, min_ms, date_set=None):
+        reviews = {}
+        # 페이지 이동으로 세션 토큰 확보
+        self.driver.get(CHANNEL_META["MRT"]["page"])
+        time.sleep(3)
+        js = """
+        var page=P[0], size=P[1];
+        var tok=localStorage.getItem('accessToken');
+        var res=await fetch('https://api3-backoffice.myrealtrip.com/review/partner/reviews/search',
+            {method:'POST', credentials:'include',
+             headers:{'Content-Type':'application/json','partner-access-token':tok},
+             body:JSON.stringify({page:page, pageSize:size})});
+        var j=await res.json();
+        var list=Array.isArray(j.data)?j.data:[];
+        done({rows:list.map(function(x){return {code:x.reservationNo, rating:x.score,
+              rdate:x.createdAt, tdate:x.travelStartDate};}),
+              total:(j.meta&&j.meta.totalCount)||null});
+        """
+        page, size = 1, 50
+        while page <= 200:
+            r = self._fetch_page(js, page, size)
+            if not r or r.get("error"):
+                self.log(f"  ⚠ [MRT] p{page} 오류: {r.get('error') if r else 'no-resp'}")
+                break
+            rows = r.get("rows") or []
+            if not rows:
+                break
+            oldest_ok = True
+            for x in rows:
+                code = norm_code(x.get("code"))
+                d = (x.get("tdate") or "")[:10]
+                if code and (not date_set or d in date_set):
+                    reviews[code] = self._fmt_rating(x.get("rating"))
+                if not self._within_iso(x.get("rdate"), min_ms):
+                    oldest_ok = False
+            self.log(f"  → [MRT] p{page}: {len(rows)}건 (기간내 누적 {len(reviews)})")
+            if len(rows) < size:
+                self.log("  → [MRT] 종료: 페이지 끝(전량 수집)")
+                break
+            page += 1
+            time.sleep(0.15)
+        return reviews
+
+    def collect_gg(self, gg_from, gg_to):
+        reviews = {}
+        cap = self.capture_request(CHANNEL_META["GG"]["page"], "/graphql",
+                                   body_contains="bookingReference", wait=12)
+        if not cap or not cap.get("body"):
+            self.log("  ⚠ [GG] GraphQL 요청 캡처 실패")
+            return reviews
+        # GG는 리뷰에 정확한 투어날짜가 없어 활동일(travelDate) 범위(기간±1)로 서버 필터 후 전부 스캔
+        js = """
+        var cap=P[0], off=P[1], size=P[2], dfrom=P[3], dto=P[4];
+        var payload={};
+        try{ payload=JSON.parse(cap.body); }catch(e){}
+        payload.variables = payload.variables || {};
+        var inp = payload.variables.input || {};
+        inp.travelDateFrom = dfrom;
+        inp.travelDateTo = dto;
+        inp.limit = size;
+        inp.offset = off;
+        payload.variables.input = inp;
+        var st=0, txt="";
+        try{
+          var res=await fetch(cap.url, {method:'POST', credentials:'include',
+              headers:Object.assign({}, cap.headers||{}, {'Content-Type':'application/json',
+                  'apollo-require-preflight':'true',
+                  'x-apollo-operation-name':(payload.operationName||'Reviews_ReviewSearch')}),
+              body:JSON.stringify(payload)});
+          st=res.status; txt=await res.text();
+        }catch(e){ txt=''; }
+        var j=null; try{ j=JSON.parse(txt); }catch(e){}
+        function findArr(o,d){ if(d>12||!o||typeof o!=='object') return null;
+          if(Array.isArray(o)&&o.length&&o[0]&&(o[0].bookingReference!==undefined||o[0].reviewId!==undefined)) return o;
+          for(var k in o){ var r=findArr(o[k],d+1); if(r) return r; } return null; }
+        var list=j?(findArr(j,0)||[]):[];
+        var dbg=null;
+        if(!list.length){ dbg={status:st, hasBody:(txt&&txt.length>0),
+            errors:(j&&j.errors?JSON.stringify(j.errors).slice(0,200):null)}; }
+        done({rows:list.map(function(x){return {code:x.bookingReference, rating:x.rating};}), dbg:dbg});
+        """
+        page, size = 1, 50
+        while page <= 100:
+            off = (page - 1) * size
+            r = self._fetch_page(js, cap, off, size, gg_from, gg_to)
+            if not r or r.get("error"):
+                self.log(f"  ⚠ [GG] p{page} 오류: {r.get('error') if r else 'no-resp'}")
+                break
+            rows = r.get("rows") or []
+            if not rows:
+                if page == 1 and r.get("dbg"):
+                    self.log(f"  🔎 [GG] 응답: {r.get('dbg')}")
+                break
+            for x in rows:
+                code = norm_code(x.get("code"))
+                if code:
+                    reviews[code] = self._fmt_rating(x.get("rating"))
+            self.log(f"  → [GG] p{page}: {len(rows)}건 (누적 {len(reviews)})")
+            if len(rows) < size:
+                self.log("  → [GG] 종료: 페이지 끝")
+                break
+            page += 1
+            time.sleep(0.2)
+        return reviews
+
+    # ---------- 수집 보조 ----------
+    @staticmethod
+    def _fmt_rating(v):
+        if v is None:
+            return ""
         try:
-            reset_btn = WebDriverWait(self.driver, KKDAY_WAIT).until(
-                EC.element_to_be_clickable((By.XPATH, '//*[@id="cancelBtn"]/span'))
-            )
-            self.driver.execute_script("arguments[0].click();", reset_btn)
-            time.sleep(0.8)
-            print("  ✅ KKDAY Reset 클릭 완료")
-            return True
-        except Exception as e:
-            print(f"  ⚠ KKDAY Reset 클릭 실패: {e}")
-            return False
+            f = float(v)
+            return str(int(f)) if f == int(f) else f"{f:.1f}"
+        except (ValueError, TypeError):
+            return str(v).strip()
 
-    def _kkday_open_departure_date_picker(self):
-        candidates = [
-            ('//*[@id="defaultLayout"]/div/section[2]/div[1]/div[2]/div[1]/div/div[1]/div[3]/div/label', "label_xpath"),
-            ('//label[normalize-space(.)="Departure date"]', "label_text"),
-        ]
-        for xp, _name in candidates:
-            try:
-                label = WebDriverWait(self.driver, KKDAY_WAIT).until(
-                    EC.presence_of_element_located((By.XPATH, xp))
-                )
-                container = label.find_element(By.XPATH, "./..")
-                try:
-                    inp = container.find_element(By.XPATH, ".//input")
-                except:
-                    inp = label.find_element(By.XPATH, ".//following::input[1]")
-
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
-                time.sleep(0.2)
-                self.driver.execute_script("arguments[0].click();", inp)
-                time.sleep(0.6)
-                return True
-            except:
-                continue
-        return False
-
-    def _kkday_open_release_date_picker(self):
-        """Release date 픽커 열기 (리뷰 날짜 기준 모드용)"""
-        candidates = [
-            # ✅ label 텍스트로 찾기 (가장 안전)
-            ('//label[normalize-space(.)="Release date"]', "label_text"),
-            # 백업: 사용자가 알려준 절대경로
-            ('//*[@id="defaultLayout"]/div/section[2]/div[1]/div[2]/div[1]/div/div[1]/div[2]/div/div//input', "abs_path_input"),
-        ]
-        for xp, _name in candidates:
-            try:
-                if "label" in _name:
-                    label = WebDriverWait(self.driver, KKDAY_WAIT).until(
-                        EC.presence_of_element_located((By.XPATH, xp))
-                    )
-                    container = label.find_element(By.XPATH, "./..")
-                    try:
-                        inp = container.find_element(By.XPATH, ".//input")
-                    except:
-                        inp = label.find_element(By.XPATH, ".//following::input[1]")
-                else:
-                    inp = WebDriverWait(self.driver, KKDAY_WAIT).until(
-                        EC.element_to_be_clickable((By.XPATH, xp))
-                    )
-
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
-                time.sleep(0.2)
-                self.driver.execute_script("arguments[0].click();", inp)
-                time.sleep(0.6)
-                print("  ✅ KKDAY Release date 픽커 열림")
-                return True
-            except:
-                continue
-        print("  ⚠ KKDAY Release date 픽커 열기 실패")
-        return False
-
-    def _kkday_find_visible_calendar_root(self):
-        """현재 화면에 보이는 daterangepicker 루트 div를 찾기.
-        Release date / Departure date 픽커 모두 동적으로 처리."""
-        # 1순위: daterangepicker 클래스 + 보이는 것
-        candidates = [
-            '//div[contains(@class,"daterangepicker") and contains(@style,"display: block")]',
-            '//div[contains(@class,"daterangepicker")]',
-            '/html/body/div[3]',
-            '/html/body/div[4]',
-            '/html/body/div[5]',
-        ]
-        for xp in candidates:
-            try:
-                els = self.driver.find_elements(By.XPATH, xp)
-                for el in els:
-                    try:
-                        if el.is_displayed():
-                            # 안에 table이 있는지 확인
-                            tbls = el.find_elements(By.XPATH, './/table')
-                            if tbls:
-                                return el
-                    except:
-                        continue
-            except:
-                continue
-        return None
-
-    def _kkday_find_calendar_table_for_month(self, target_date):
-        month_map = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        target_header = f"{month_map[target_date.month - 1]} {target_date.year}"
-
-        # ✅ 동적으로 보이는 캘린더 루트 찾기
-        root = self._kkday_find_visible_calendar_root()
-
-        if root is not None:
-            tables = root.find_elements(By.XPATH, './/table')
-        else:
-            # 백업: 전체 body에서 찾기
-            tables = self.driver.find_elements(By.XPATH, '//div[contains(@class,"daterangepicker")]//table')
-            if not tables:
-                tables = self.driver.find_elements(By.XPATH, '/html/body/div[3]//table')
-
-        for tbl in tables:
-            try:
-                header_el = tbl.find_element(By.XPATH, './/thead/tr[1]/th[2]')
-                header_text = (header_el.text or "").strip()
-                if header_text == target_header:
-                    return tbl
-            except:
-                continue
-
-        # 디버깅: 어떤 헤더가 보이는지 출력
+    @staticmethod
+    def _to_ms(v):
+        """epoch(ms/s) 숫자 또는 날짜 문자열('YYYY-MM-DD ...', ISO, '... (GMT+9)') -> epoch ms."""
+        if v is None or v == "":
+            return None
         try:
-            headers_seen = []
-            for tbl in tables:
-                try:
-                    h = tbl.find_element(By.XPATH, './/thead/tr[1]/th[2]')
-                    headers_seen.append((h.text or "").strip())
-                except:
-                    pass
-            if headers_seen:
-                print(f"      🔎 보이는 캘린더 헤더: {headers_seen}, 찾는 헤더: {target_header}")
-        except:
+            n = float(v)
+            return int(n if n > 1e12 else n * 1000)
+        except (ValueError, TypeError):
             pass
-
-        return None
-
-    def _kkday_click_calendar_prev(self):
-        # ✅ 동적으로 보이는 캘린더 루트 안에서 prev 버튼 찾기
-        root = self._kkday_find_visible_calendar_root()
         try:
-            if root is not None:
-                btn = root.find_element(By.XPATH, './/th[contains(@class,"prev")]')
-            else:
-                btn = self.driver.find_element(By.XPATH,
-                    '//div[contains(@class,"daterangepicker")]//th[contains(@class,"prev")] | /html/body/div[3]//th[contains(@class,"prev")]')
-            self.driver.execute_script("arguments[0].click();", btn)
-            time.sleep(0.25)
-            return True
-        except:
-            return False
-
-    def _kkday_click_calendar_next(self):
-        # ✅ 동적으로 보이는 캘린더 루트 안에서 next 버튼 찾기
-        root = self._kkday_find_visible_calendar_root()
-        try:
-            if root is not None:
-                btn = root.find_element(By.XPATH, './/th[contains(@class,"next")]')
-            else:
-                btn = self.driver.find_element(By.XPATH,
-                    '//div[contains(@class,"daterangepicker")]//th[contains(@class,"next")] | /html/body/div[3]//th[contains(@class,"next")]')
-            self.driver.execute_script("arguments[0].click();", btn)
-            time.sleep(0.25)
-            return True
-        except:
-            return False
-
-    def _kkday_click_day_in_table(self, table_el, day: int):
-        xps = [
-            f'.//tbody//td[contains(@class,"available") and not(contains(@class,"off")) and normalize-space(text())="{day}"]',
-            f'.//tbody//td[not(contains(@class,"off")) and normalize-space(text())="{day}"]',
-        ]
-        for xp in xps:
-            try:
-                cell = table_el.find_element(By.XPATH, xp)
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cell)
-                time.sleep(0.1)
-                self.driver.execute_script("arguments[0].click();", cell)
-                time.sleep(0.25)
-                return True
-            except:
-                continue
-        return False
-
-    def _kkday_pick_date_range(self, start_date, end_date):
-        """공통: 캘린더에서 start ~ end 날짜 클릭 (Departure / Release 둘 다 사용)"""
-        def get_table_or_move(dt):
-            tbl = self._kkday_find_calendar_table_for_month(dt)
-            if tbl:
-                return tbl
-            for _ in range(24):
-                self._kkday_click_calendar_next()
-                tbl = self._kkday_find_calendar_table_for_month(dt)
-                if tbl:
-                    return tbl
-            for _ in range(24):
-                self._kkday_click_calendar_prev()
-                tbl = self._kkday_find_calendar_table_for_month(dt)
-                if tbl:
-                    return tbl
+            t = str(v).split("(")[0].strip()
+            return to_epoch_ms(pd.Timestamp(t))
+        except Exception:
             return None
 
-        start_tbl = get_table_or_move(start_date)
-        if not start_tbl:
-            print("  ⚠ start 월 테이블 못 찾음")
-            return False
-        if not self._kkday_click_day_in_table(start_tbl, start_date.day):
-            print("  ⚠ start day 클릭 실패")
-            return False
+    @staticmethod
+    def _within(value, min_ms):
+        ms = PowerReviewApp._to_ms(value)
+        return True if ms is None else ms >= min_ms
 
-        end_tbl = get_table_or_move(end_date)
-        if not end_tbl:
-            print("  ⚠ end 월 테이블 못 찾음")
-            return False
-        if not self._kkday_click_day_in_table(end_tbl, end_date.day):
-            print("  ⚠ end day 클릭 실패")
-            return False
+    @staticmethod
+    def _within_iso(value, min_ms):
+        return PowerReviewApp._within(value, min_ms)
 
-        time.sleep(0.5)
-        return True
+    # ---------------------------------------------------------
+    # 실행
+    # ---------------------------------------------------------
+    def start_processing(self):
+        if not self.driver:
+            messagebox.showerror("오류", "먼저 크롬을 연결하세요!")
+            return
+        if self.df is None:
+            messagebox.showerror("오류", "먼저 엑셀을 선택하세요!")
+            return
+        sel_dates = self._selected_dates()
+        sel_branches = self._selected_branches()
+        sel_guides = [g for g, var in self.guide_vars.items() if var.get()]
+        if not sel_dates:
+            messagebox.showerror("오류", "최소 1개 날짜를 선택하세요!")
+            return
+        if not sel_branches:
+            messagebox.showerror("오류", "최소 1개 지사를 선택하세요!")
+            return
+        if not sel_guides:
+            messagebox.showerror("오류", "최소 1명 가이드를 선택하세요!")
+            return
 
-    def _kkday_set_departure_date_range(self, start_date, end_date):
-        if not self._kkday_open_departure_date_picker():
-            return False
+        df = self.df[
+            self.df["Date"].dt.normalize().isin(sel_dates)
+            & self.df["Area"].isin(sel_branches)
+            & self.df["Main Guide"].isin(sel_guides)
+        ].copy()
+        if df.empty:
+            messagebox.showerror("오류", "선택 조건에 해당하는 데이터가 없습니다.")
+            return
 
-        ok = self._kkday_pick_date_range(start_date, end_date)
-        if ok:
-            print(f"  ✅ KKDAY Departure date 선택 완료: {start_date} ~ {end_date}")
-        return ok
-
-    def _kkday_set_release_date_range(self, start_date, end_date):
-        """Release date 범위 선택"""
-        if not self._kkday_open_release_date_picker():
-            return False
-
-        ok = self._kkday_pick_date_range(start_date, end_date)
-        if ok:
-            print(f"  ✅ KKDAY Release date 선택 완료: {start_date} ~ {end_date}")
-        return ok
-
-    def _kkday_set_rating_4_5_only(self):
         try:
-            cb5 = WebDriverWait(self.driver, KKDAY_WAIT).until(
-                EC.presence_of_element_located((By.ID, "scoreCheckbox_5"))
-            )
-            cb4 = WebDriverWait(self.driver, KKDAY_WAIT).until(
-                EC.presence_of_element_located((By.ID, "scoreCheckbox_4"))
-            )
+            self.detail_lines = []
+            self.result_text.delete(1.0, "end")
+            self.log("📊 리뷰 조회 시작 (API)")
+            self.log("=" * 70)
 
-            try:
-                others = self.driver.find_elements(
-                    By.XPATH,
-                    '//input[starts-with(@id,"scoreCheckbox_") and not(@id="scoreCheckbox_5") and not(@id="scoreCheckbox_4")]'
-                )
-                for o in others:
-                    try:
-                        if o.is_selected():
-                            self.driver.execute_script("arguments[0].click();", o)
-                            time.sleep(0.05)
-                    except:
-                        pass
-            except:
-                pass
+            df["Review_Status"] = ""
+            df["Rating"] = ""
+            df["Check"] = ""
 
-            if not cb5.is_selected():
-                self.driver.execute_script("arguments[0].click();", cb5)
-                time.sleep(0.1)
-            if not cb4.is_selected():
-                self.driver.execute_script("arguments[0].click();", cb4)
-                time.sleep(0.1)
+            report_min = pd.Timestamp(min(sel_dates)).normalize()
+            report_max = pd.Timestamp(max(sel_dates)).normalize()
+            # 리뷰는 투어 이후 작성되므로 '작성일 >= 리포트 시작일 -1(GG ±1 버퍼)'까지 긁고 종료
+            min_ms = to_epoch_ms(report_min - timedelta(days=1))
+            date_set = {pd.Timestamp(ts).strftime("%Y-%m-%d") for ts in sel_dates}
+            # GG는 활동일(travelDate) 범위 필터 = 리포트 기간 ±1일 (사용자 GG 로직)
+            gg_from = (report_min - timedelta(days=1)).strftime("%Y-%m-%d")
+            gg_to = (report_max + timedelta(days=1)).strftime("%Y-%m-%d")
+            # TPC는 리뷰 '작성일' 기준 → 투어 시작일 ~ 조회일(오늘) 사이 작성 리뷰
+            _today = pd.Timestamp.now().normalize()
+            tpc_from = report_min.strftime("%Y-%m-%d")
+            tpc_to = max(report_max, _today).strftime("%Y-%m-%d")
 
-            print("  ✅ KKDAY rating 5/4 체크 완료")
+            self.log(f"📅 기간: {report_min.strftime('%Y-%m-%d')} ~ "
+                     f"{report_max.strftime('%Y-%m-%d')}  "
+                     f"(지사 {df['Area'].nunique()}개 · 예약 {len(df)}건)")
+            self.log(f"   · TPC 리뷰작성일 검색: {tpc_from} ~ {tpc_to}")
+
+            pw = self.create_progress_window()
+
+            used = [c for c in CHANNELS if c in set(df["Agency"])]
+            collected = {}
+            extras = {}
+            self.log("\n" + "=" * 70)
+            self.log("1단계: 채널별 리뷰 수집")
+            self.log("=" * 70)
+
+            collectors = {
+                "L": lambda: self.collect_klook(min_ms, date_set),
+                "KK": lambda: self.collect_kkday(report_min, report_max),
+                "GG": lambda: self.collect_gg(gg_from, gg_to),
+                "TPC": lambda: self.collect_ctrip(min_ms, tpc_from, tpc_to),
+                "MRT": lambda: self.collect_mrt(min_ms, date_set),
+            }
+            for i, ch in enumerate(used):
+                pw.label.config(text=f"[{ch}] {CHANNEL_META[ch]['name']} 리뷰 수집 중...")
+                pw.progress_bar["value"] = (i / max(len(used), 1)) * 100
+                pw.window.update()
+                self.log(f"\n🔍 [{ch}] {CHANNEL_META[ch]['name']}")
+                try:
+                    res = collectors[ch]()
+                    if isinstance(res, tuple):
+                        collected[ch], extras[ch] = res
+                    else:
+                        collected[ch], extras[ch] = res, []
+                    self.log(f"  ✓ [{ch}] {len(collected[ch])}건 수집")
+                except Exception as e:
+                    collected[ch] = {}; extras[ch] = []
+                    self.log(f"  ✗ [{ch}] 수집 실패: {e}")
+                    traceback.print_exc()
+
+            # 2단계: 매칭
+            self.log("\n" + "=" * 70)
+            self.log("2단계: 예약번호 매칭")
+            self.log("=" * 70)
+            def _is_good(rt):
+                try:
+                    return float(rt) >= 4
+                except (ValueError, TypeError):
+                    return False
+            for idx, row in df.iterrows():
+                ch = row["Agency"]
+                code = norm_code(row["Agency Code"])
+                if ch in collected:
+                    if code in collected[ch]:
+                        rt = collected[ch][code]
+                        df.at[idx, "Rating"] = rt
+                        if _is_good(rt):
+                            df.at[idx, "Review_Status"] = "GOOD"
+                            df.at[idx, "Check"] = "✓"          # 좋은리뷰(4-5)
+                        else:
+                            df.at[idx, "Review_Status"] = "LOW"
+                            df.at[idx, "Check"] = "▲"          # 낮은평점(1-3) → 집계 제외
+                    else:
+                        df.at[idx, "Review_Status"] = "NO"
+                        df.at[idx, "Check"] = "✗"
+                else:
+                    df.at[idx, "Review_Status"] = "SKIP"
+
+            pw.window.destroy()
+
+            self._result_df = df
+            report = self.build_report(df, used, collected, extras)
+            self.last_report_text = report
+            self._build_copy_buttons()
+            self.result_text.delete(1.0, "end")
+            self.result_text.insert("end", report)
+            self.result_text.see("1.0")
+
+            # 자동 엑셀 저장
+            saved = self.save_excel(df, ask=False)
+            self.progress_var.set("✅ 완료" + (f" · 저장: {os.path.basename(saved)}" if saved else ""))
+            messagebox.showinfo("완료", "리뷰 조회 완료!\n\n엑셀은 폴더에 자동 저장됐어요.\n아래 '전체 Copy' 또는 '지사 Copy' 버튼으로 복사해 보낼 수 있어요.")
         except Exception as e:
-            print(f"  ⚠ KKDAY rating 체크 실패: {e}")
+            self.progress_var.set(f"❌ 오류: {e}")
+            self.log(f"오류: {e}")
+            traceback.print_exc()
+            messagebox.showerror("오류", f"처리 중 오류:\n{e}")
 
-    def _kkday_click_search(self):
-        try:
-            btn = WebDriverWait(self.driver, KKDAY_WAIT).until(
-                EC.element_to_be_clickable((By.XPATH, '//*[@id="searchBtn"]'))
-            )
-            self.driver.execute_script("arguments[0].click();", btn)
-            time.sleep(1.2)
-            print("  ✅ KKDAY Search 클릭 완료(최초 1회)")
-        except Exception as e:
-            print(f"  ⚠ KKDAY Search 클릭 실패: {e}")
+    def create_progress_window(self):
+        w = Toplevel(self.root)
+        w.title("처리 중...")
+        w.geometry("420x110")
+        lbl = Label(w, text="시작 중...", font=("Arial", 10))
+        lbl.pack(pady=10)
+        pb = Progressbar(w, length=380, mode="determinate")
+        pb.pack(pady=10)
+        w.protocol("WM_DELETE_WINDOW", lambda: None)
+        w.progress_bar = pb
+        w.label = lbl
+        w.window = w
+        return w
 
-    def _kkday_wait_results_ready(self):
-        candidates = [
-            (By.XPATH, '//*[@id="defaultLayout"]//*[contains(., "Booking no.")]'),
-            (By.XPATH, '//*[@id="defaultLayout"]//a[contains(@href, "/v1/en/order/index/")]'),
-            (By.XPATH, '//*[@id="defaultLayout"]/div/section[2]/div[2]/div[2]'),
-        ]
-        for by, sel in candidates:
-            try:
-                WebDriverWait(self.driver, KKDAY_WAIT).until(EC.presence_of_element_located((by, sel)))
-                return True
-            except:
+    # ---------------------------------------------------------
+    # 리포트 (지사 → 날짜 → 투어/가이드)
+    # ---------------------------------------------------------
+    def _scope_label(self, df):
+        by_country = {}
+        for area in sorted(df["Area"].unique(), key=area_rank):
+            by_country.setdefault(area_country(area), []).append(AREA_KR.get(area, str(area)))
+        parts = []
+        for c, _ in COUNTRY_GROUPS:
+            if c in by_country:
+                parts.append(f"{c}({', '.join(by_country[c])})")
+        if "기타" in by_country:
+            parts.append(f"기타({', '.join(by_country['기타'])})")
+        return " · ".join(parts) if parts else "전체"
+
+    def _summary_lines(self, sub, title):
+        def ravg(vals):
+            v = [float(x) for x in vals if str(x).replace('.', '', 1).isdigit()]
+            return (sum(v) / len(v)) if v else 0
+        out = []
+        out.append("=" * 68)
+        out.append(f"📈 {title}")
+        out.append("=" * 68)
+        tt = len(sub); tp = int(sub["People"].sum())
+        rev = sub[sub["Agency"].isin(CHANNELS)]; nch = len(rev)
+        chk = int((sub["Check"] == "✓").sum()); bad = int((sub["Check"] == "▲").sum())
+        out.append(f"👥 총 예약: {tt}팀 {tp}명")
+        out.append(f"✓ 좋은리뷰(4-5점): {chk}팀")
+        if nch:
+            out.append(f"   └ 5개 채널: {chk}/{nch}팀 ({chk/nch*100:.1f}%)")
+        if tt:
+            out.append(f"   └ 전체:     {chk}/{tt}팀 ({chk/tt*100:.1f}%)")
+        if bad:
+            out.append(f"▲ 낮은평점(1-3점): {bad}팀 (집계 제외)")
+        avg = ravg(sub.loc[sub["Check"].isin(["✓", "▲"]), "Rating"].tolist())
+        out.append(f"⭐ 평균 별점(전체 1-5): {avg:.1f}점" if avg else "⭐ 평균 별점: N/A")
+        out.append("\n[채널별]")
+        for ch in CHANNELS:
+            cs = sub[sub["Agency"] == ch]
+            if len(cs) == 0:
                 continue
+            c = int((cs["Check"] == "✓").sum())
+            a = ravg(cs.loc[cs["Check"].isin(["✓", "▲"]), "Rating"].tolist())
+            line = f"  {ch:4} {CHANNEL_META[ch]['name']:12} {c:3}/{len(cs):3}팀 ({c/len(cs)*100:5.1f}%)"
+            if a:
+                line += f"  평균 {a:.1f}"
+            out.append(line)
+        return out
+
+    def build_report(self, df, used, collected, extras=None):
+        L = []
+        extras = extras or {}
+        def rate_avg(vals):
+            v = [float(x) for x in vals if str(x).replace('.', '').isdigit()]
+            return (sum(v) / len(v)) if v else 0.0
+
+        # ---- 전체 요약 ----
+        total_teams = len(df)
+        total_people = int(df["People"].sum())
+        rev_mask = df["Agency"].isin(CHANNELS)
+        rev_teams = int(rev_mask.sum())
+        rev_people = int(df.loc[rev_mask, "People"].sum())
+        checked = int((df["Check"] == "✓").sum())
+        bad = int((df["Check"] == "▲").sum())
+        all_ratings = df.loc[df["Check"].isin(["✓", "▲"]), "Rating"].tolist()
+
+        L.append("=" * 68)
+        L.append(f"📈 전체 요약  [{self._scope_label(df)}]")
+        L.append("=" * 68)
+        if self.noshow_teams:
+            L.append(f"🚫 No Show(O) 제외: {self.noshow_teams}팀 {self.noshow_people}명")
+        L.append(f"👥 총 예약: {total_teams}팀 {total_people}명")
+        L.append(f"   └ 리뷰 조회대상(L/KK/GG/TPC/MRT): {rev_teams}팀 {rev_people}명")
+        L.append(f"✓ 좋은리뷰(4-5점): {checked}팀")
+        if rev_teams:
+            L.append(f"   └ 5개 채널 기준: {checked}/{rev_teams}팀 ({checked/rev_teams*100:.1f}%)")
+        if total_teams:
+            L.append(f"   └ 전체 기준:   {checked}/{total_teams}팀 ({checked/total_teams*100:.1f}%)")
+        if bad:
+            L.append(f"▲ 낮은평점(1-3점): {bad}팀 (집계 제외)")
+        avg = rate_avg(all_ratings)
+        L.append(f"⭐ 평균 별점(전체 1-5): {avg:.1f}점" if avg else "⭐ 평균 별점: N/A")
+
+        # 채널별
+        L.append("\n[채널별]")
+        for ch in CHANNELS:
+            sub = df[df["Agency"] == ch]
+            if len(sub) == 0:
+                continue
+            c = int((sub["Check"] == "✓").sum())
+            a = rate_avg(sub.loc[sub["Check"].isin(["✓", "▲"]), "Rating"].tolist())
+            line = f"  {ch:4} {CHANNEL_META[ch]['name']:12} {c:3}/{len(sub):3}팀 ({c/len(sub)*100:5.1f}%)"
+            if a:
+                line += f"  평균 {a:.1f}"
+            L.append(line)
+
+        # 전체 리뷰 품질 (채널 단위 · 예약매칭 무관 · 익명 포함)
+        L.append("\n[전체 리뷰 품질 (채널 단위 · 익명 포함)]")
+        for ch in CHANNELS:
+            if ch not in collected:
+                continue
+            ratings = list(collected[ch].values()) + list(extras.get(ch, []))
+            if not ratings:
+                continue
+            vals = [float(x) for x in ratings if str(x).replace('.', '', 1).isdigit()]
+            n = len(ratings)
+            qa = (sum(vals) / len(vals)) if vals else 0
+            goodn = sum(1 for v in vals if v >= 4)
+            badn = sum(1 for v in vals if v < 4)
+            line = (f"  {ch:4} {CHANNEL_META[ch]['name']:12} 리뷰 {n:3}건 · 평균 {qa:.1f}"
+                    f" · 좋은리뷰(4-5) {goodn} · 나쁜리뷰(1-3) {badn}")
+            ex = len(extras.get(ch, []))
+            if ex:
+                line += f"  (익명 {ex} 포함)"
+            L.append(line)
+
+        # 조회 제외 에이전시
+        others = df[~df["Agency"].isin(CHANNELS)]
+        if len(others):
+            L.append("\n[조회 제외 에이전시]")
+            for ag, g in others.groupby("Agency"):
+                L.append(f"  {ag:10} {len(g):3}팀 {int(g['People'].sum()):3}명 (개별 확인 필요)")
+
+        # ---- 국가 → 지사 → 날짜 → 가이드/투어 ----
+        self._branch_texts = {}
+        cur_country = None
+        for area in sorted(df["Area"].unique(), key=area_rank):
+            adf = df[df["Area"] == area]
+            country = area_country(area)
+            if country != cur_country:
+                L.append("\n" + "#" * 68)
+                L.append(f"🌏 {country}")
+                L.append("#" * 68)
+                cur_country = country
+            b_start = len(L)   # 지사 섹션 시작 (지사별 Copy용)
+            a_rev = adf[adf["Agency"].isin(CHANNELS)]
+            a_chk = int((adf["Check"] == "✓").sum())
+            a_bad = int((adf["Check"] == "▲").sum())
+            a_avg = rate_avg(adf.loc[adf["Check"].isin(["✓", "▲"]), "Rating"].tolist())
+            n_all = len(adf); n_ch = len(a_rev)
+            L.append("\n" + "=" * 68)
+            head = f"🏢 [지사: {area}]  예약 {n_all}팀 {int(adf['People'].sum())}명"
+            if n_ch:
+                head += f"  ·  5채널 {a_chk}/{n_ch} ({a_chk/n_ch*100:.1f}%)"
+            head += f"  ·  전체 {a_chk}/{n_all} ({a_chk/n_all*100:.1f}%)"
+            if a_avg:
+                head += f"  ·  평균 {a_avg:.1f}"
+            if a_bad:
+                head += f"  ·  낮은평점 {a_bad}"
+            L.append(head)
+            L.append("=" * 68)
+
+            for date_val, ddf in adf.groupby(adf["Date"].dt.normalize()):
+                L.append(f"\n  ── {pd.Timestamp(date_val).strftime('%Y-%m-%d (%a)')} ──")
+                for (guide, product), g in ddf.groupby(["Main Guide", "Product"]):
+                    teams = len(g)
+                    people = int(g["People"].sum())
+                    L.append(f"  • {guide} / {product} / {teams}팀 {people}명")
+                    g5 = g[g["Agency"].isin(CHANNELS)]
+                    n5 = len(g5); c5 = int((g5["Check"] == "✓").sum())
+                    nAll = len(g); cAll = int((g["Check"] == "✓").sum())
+                    tavg = rate_avg(g.loc[g["Check"].isin(["✓", "▲"]), "Rating"].tolist())
+                    roll = "      ▶ "
+                    if n5:
+                        roll += f"5채널 {c5}/{n5} ({c5/n5*100:.0f}%) · "
+                    roll += f"전체 {cAll}/{nAll} ({cAll/nAll*100:.0f}%)"
+                    if tavg:
+                        roll += f" · 평균 {tavg:.1f}"
+                    L.append(roll)
+                    for ch in CHANNELS:
+                        cg = g[g["Agency"] == ch]
+                        if len(cg) == 0:
+                            continue
+                        c = int((cg["Check"] == "✓").sum())
+                        pct = f" ({c/len(cg)*100:.0f}%)" if len(cg) else ""
+                        L.append(f"      [{ch}] {c}/{len(cg)}{pct}")
+                        for _, r in cg.iterrows():
+                            code = r["Agency Code"]; rt = r["Rating"]
+                            if r["Check"] == "✓":
+                                L.append(f"        ✓{code}({rt})")
+                            elif r["Check"] == "▲":
+                                L.append(f"        ▲{code}({rt}) 낮은평점")
+                            else:
+                                L.append(f"        ✗{code}")
+                    # 조회 제외 에이전시
+                    og = g[~g["Agency"].isin(CHANNELS)]
+                    for ag, gg in og.groupby("Agency"):
+                        codes = ", ".join(gg["Agency Code"].tolist())
+                        L.append(f"      [{ag}] {len(gg)}팀 (개별확인): {codes}")
+
+            _b_detail = "\n".join(L[b_start:])
+            _b_summary = "\n".join(self._summary_lines(adf, f"지사: {AREA_KR.get(area, str(area))} 요약"))
+            self._branch_texts[area] = _b_summary + "\n\n" + _b_detail   # 지사 Copy = 요약+상세
+
+        L.append("\n" + "=" * 68)
+        return "\n".join(L)
+
+    # ---------------------------------------------------------
+    # 엑셀 저장 / Copy
+    # ---------------------------------------------------------
+    @staticmethod
+    def _autofit(ws):
+        from openpyxl.utils import get_column_letter
+        for col in ws.columns:
+            m = 0
+            letter = get_column_letter(col[0].column)
+            for cell in col:
+                if cell.value is None:
+                    continue
+                w = sum(2 if ord(ch) > 0x1100 else 1 for ch in str(cell.value))
+                if w > m:
+                    m = w
+            ws.column_dimensions[letter].width = min(max(m + 2, 8), 60)
+
+    @staticmethod
+    def _safe_name(s):
+        s = re.sub(r'[\\/:*?"<>|]', "_", str(s)).strip()
+        return (s or "unnamed")[:80]
+
+    def _write_sheet(self, path, df_out, sheet="Sheet1"):
+        with pd.ExcelWriter(path, engine="openpyxl") as w:
+            df_out.to_excel(w, index=False, sheet_name=sheet)
+            self._autofit(w.sheets[sheet])
+
+    def _guide_frame(self, sub, guide_cols):
+        """가이드 1명 시트: 데이터 위, 요약(전체기간 → 날짜별) 아래에 모아서."""
+        def _avg(vals):
+            v = [float(x) for x in vals if str(x).replace(".", "", 1).isdigit()]
+            return round(sum(v) / len(v), 1) if v else 0
+
+        def _stat(d):
+            s5 = d[d["Agency"].isin(CHANNELS)]
+            y5 = len(s5); x5 = int((s5["Check"] == "✓").sum())
+            a5 = _avg(s5.loc[s5["Check"].isin(["✓", "▲"]), "Rating"].tolist())
+            p5 = round(x5 / y5 * 100, 1) if y5 else 0
+            yA = len(d); xA = int((d["Check"] == "✓").sum())
+            aA = _avg(d.loc[d["Check"].isin(["✓", "▲"]), "Rating"].tolist())
+            pA = round(xA / yA * 100, 1) if yA else 0
+            return (x5, y5, p5, a5, xA, yA, pA, aA)
+
+        sub = sub.sort_values(by=["Date"])
+        blank = {c: "" for c in guide_cols}
+        rows = []
+        # 1) 데이터 (날짜 바뀌면 빈 줄)
+        prev = None
+        for _, row in sub.iterrows():
+            if prev is not None and row["Date"] != prev:
+                rows.append(dict(blank))
+            rows.append({c: row[c] for c in guide_cols})
+            prev = row["Date"]
+        # 2) 요약: 전체기간 먼저
+        rows.append(dict(blank))
+        rows.append(dict(blank))
+        x5, y5, p5, a5, xA, yA, pA, aA = _stat(sub)
+        rows.append({**blank, "Date": "[전체기간 5채널]", "Product": f"리뷰 {x5}/{y5} ({p5}%) · 평균 {a5}점"})
+        rows.append({**blank, "Date": "[전체기간 전체]", "Product": f"리뷰 {xA}/{yA} ({pA}%) · 평균 {aA}점"})
+        rows.append(dict(blank))
+        # 3) 날짜별 소계
+        for date_val, ddf in sub.groupby("Date"):
+            x5, y5, p5, a5, xA, yA, pA, aA = _stat(ddf)
+            rows.append({**blank, "Date": f"[{date_val} 5채널]", "Product": f"리뷰 {x5}/{y5} ({p5}%) · 평균 {a5}점"})
+            rows.append({**blank, "Date": f"[{date_val} 전체]", "Product": f"리뷰 {xA}/{yA} ({pA}%) · 평균 {aA}점"})
+            rows.append(dict(blank))
+        return pd.DataFrame(rows, columns=guide_cols)
+
+    def _ensure_pdf_font(self):
+        """PDF용 한글 폰트 1회 등록. TTF(맑은고딕 등) 임베드 우선, 없으면 내장 CID 폴백."""
+        if getattr(self, "_pdf_font", None) is not None:
+            return self._pdf_font
+        try:
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
+        except Exception:
+            self._pdf_font = False
+            return False
+        ttf_candidates = [
+            r"C:\Windows\Fonts\malgun.ttf",
+            r"C:\Windows\Fonts\malgunbd.ttf",
+            r"C:\Windows\Fonts\NanumGothic.ttf",
+            "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+            "/Library/Fonts/AppleGothic.ttf",
+            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        ]
+        for p in ttf_candidates:
+            try:
+                if os.path.exists(p):
+                    pdfmetrics.registerFont(TTFont("KRFONT", p))
+                    pdfmetrics.registerFontFamily("KRFONT", normal="KRFONT", bold="KRFONT",
+                                                  italic="KRFONT", boldItalic="KRFONT")
+                    self._pdf_font = "KRFONT"
+                    return self._pdf_font
+            except Exception:
+                continue
+        # 폴백: reportlab 내장 한국어 CID 폰트 (뷰어 한글팩 필요)
+        try:
+            from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+            pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
+            pdfmetrics.registerFontFamily("HYSMyeongJo-Medium", normal="HYSMyeongJo-Medium",
+                                          bold="HYSMyeongJo-Medium", italic="HYSMyeongJo-Medium",
+                                          boldItalic="HYSMyeongJo-Medium")
+            self._pdf_font = "HYSMyeongJo-Medium"
+            return self._pdf_font
+        except Exception:
+            self._pdf_font = False
+            return False
+
+    def _ensure_pdf_symbol_font(self):
+        """✓/✗/▲ 표시용 심볼 폰트. Segoe UI Symbol 우선, 없으면 False(→O/X 치환)."""
+        if getattr(self, "_pdf_sym", None) is not None:
+            return self._pdf_sym
+        try:
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
+        except Exception:
+            self._pdf_sym = False
+            return False
+        cands = [
+            r"C:\Windows\Fonts\seguisym.ttf",   # Windows: Segoe UI Symbol (✓✗▲ 포함)
+            r"C:\Windows\Fonts\arialuni.ttf",
+            "/System/Library/Fonts/Apple Symbols.ttf",
+            "/usr/local/lib/python3.10/dist-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans.ttf",
+        ]
+        for pth in cands:
+            try:
+                if os.path.exists(pth):
+                    pdfmetrics.registerFont(TTFont("SYMFONT", pth))
+                    self._pdf_sym = "SYMFONT"
+                    return self._pdf_sym
+            except Exception:
+                continue
+        self._pdf_sym = False
         return False
 
-    def _kkday_click_all_show_original(self):
+    def _write_guide_pdf(self, path, gdf, title):
+        """가이드 프레임을 표 PDF로 저장. reportlab/폰트 없으면 조용히 False."""
+        font = self._ensure_pdf_font()
+        if not font:
+            return False
         try:
-            links = self.driver.find_elements(By.XPATH, '//a[contains(., "Show original")]')
-            clicked = 0
-            for a in links:
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib import colors
+            from reportlab.lib.units import mm
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+            from reportlab.lib.styles import ParagraphStyle
+
+            def esc(x):
+                return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+            cols = list(gdf.columns)
+            styN = ParagraphStyle("n", fontName=font, fontSize=7.5, leading=9.5)
+            styT = ParagraphStyle("t", fontName=font, fontSize=13, leading=16)
+            pidx = cols.index("Product") if "Product" in cols else -1
+            cidx = cols.index("Check") if "Check" in cols else -1
+            sym = self._ensure_pdf_symbol_font()
+            _symmap = {"✓": "O", "✗": "X"}
+            _hdr = ["Review Status" if _c == "Review_Status" else _c for _c in cols]
+            data = [_hdr]
+            sumrows = []
+            for i, (_, r) in enumerate(gdf.iterrows(), start=1):
+                vals = ["" if pd.isna(r[c]) else str(r[c]) for c in cols]
+                if vals and str(vals[0]).startswith("["):
+                    sumrows.append(i)
+                if cidx >= 0 and not sym:
+                    vals[cidx] = _symmap.get(vals[cidx], vals[cidx])
+                if pidx >= 0:
+                    vals[pidx] = Paragraph(esc(vals[pidx]), styN)
+                data.append(vals)
+            wmap = {"Date": 24, "Area": 15, "Product": 88, "Agency": 15, "Agency Code": 32,
+                    "Review_Status": 28, "Rating": 16, "Check": 16}
+            widths = [wmap.get(c, 20) * mm for c in cols]
+            t = Table(data, colWidths=widths, repeatRows=1)
+            st = [("FONTNAME", (0, 0), (-1, -1), font), ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                  ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                  ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+                  ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#BBBBBB")),
+                  ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                  ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                  ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                  ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F7FB")])]
+            if pidx >= 0:
+                st.append(("ALIGN", (pidx, 0), (pidx, -1), "LEFT"))   # Product(투어명)만 좌측
+            if sym and cidx >= 0:
+                st.append(("FONTNAME", (cidx, 1), (cidx, -1), sym))   # Check ✓/✗/▲ 심볼 폰트
+            for ri in sumrows:
+                st.append(("BACKGROUND", (0, ri), (-1, ri), colors.HexColor("#FFF2CC")))
+            t.setStyle(TableStyle(st))
+            doc = SimpleDocTemplate(path, pagesize=landscape(A4),
+                                    leftMargin=10 * mm, rightMargin=10 * mm,
+                                    topMargin=10 * mm, bottomMargin=10 * mm)
+            doc.build([Paragraph(esc(title), styT), Spacer(1, 6), t])
+            return True
+        except Exception as e:
+            self.log(f"  ⚠ PDF 생성 실패({os.path.basename(path)}): {e}")
+            return False
+
+    def save_excel(self, df, ask=False):
+        try:
+            base_dir = SCRIPT_DIR
+            if ask:
+                d = filedialog.askdirectory(title="저장 폴더 선택", initialdir=base_dir)
+                if d:
+                    base_dir = d
+            out = df.copy()
+            out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
+            ranks = out["Area"].apply(area_rank)
+            out["__c"] = ranks.apply(lambda t: t[0])
+            out["__a"] = ranks.apply(lambda t: t[1] if isinstance(t[1], int) else 99)
+
+            start = out["Date"].min().replace("-", "")
+            end = out["Date"].max().replace("-", "")
+            root = os.path.join(base_dir, f"Review Crawling Result {start}-{end}")
+            os.makedirs(root, exist_ok=True)
+
+            summary_cols = [c for c in ["Date", "Area", "Main Guide", "Product",
+                                        "Agency", "Agency Code", "Review_Status", "Rating", "Check"]
+                            if c in out.columns]
+            branch_cols = [c for c in ["Date", "Main Guide", "Product",
+                                       "Agency", "Agency Code", "Review_Status", "Rating", "Check"]
+                           if c in out.columns]
+            guide_cols = [c for c in ["Date", "Area", "Product", "Agency",
+                                      "Agency Code", "Review_Status", "Rating", "Check"]
+                          if c in out.columns]
+
+            # 종합 (루트) : 종합 시트 + 지사별 탭 (가이드 탭 없음)
+            comp = out.sort_values(by=["__c", "__a", "Main Guide", "Date"])
+            jpath = os.path.join(root, "종합.xlsx")
+            used_j = {"종합"}
+
+            def _uqj(nm):
+                nm = re.sub(r'[\\/*?:\[\]]', " ", str(nm)).strip()[:31] or "sheet"
+                base = nm; k = 2
+                while nm in used_j:
+                    nm = f"{base[:28]}_{k}"; k += 1
+                used_j.add(nm)
+                return nm
+
+            with pd.ExcelWriter(jpath, engine="openpyxl") as w:
+                comp[summary_cols].rename(columns={"Review_Status": "Review Status"}).to_excel(w, sheet_name="종합", index=False)
+                self._autofit(w.sheets["종합"])
+                for area in sorted(out["Area"].unique(), key=area_rank):
+                    bsub = out[out["Area"] == area].sort_values(by=["Main Guide", "Date"])
+                    sh = _uqj(AREA_KR.get(area, str(area)))
+                    bsub[branch_cols].rename(columns={"Review_Status": "Review Status"}).to_excel(w, sheet_name=sh, index=False)
+                    self._autofit(w.sheets[sh])
+            n = 1
+
+            # 지사 폴더(서울/부산…)를 루트 바로 아래에 → 지사 전체 + 가이드별 함께
+            for area in sorted(out["Area"].unique(), key=area_rank):
+                bkr = AREA_KR.get(area, str(area))
+                bdir = os.path.join(root, self._safe_name(bkr))   # 국가 폴더 없이 지사 폴더 바로
+                os.makedirs(bdir, exist_ok=True)
+                adf = out[out["Area"] == area].sort_values(by=["Main Guide", "Date"])
+                # 지사 전체 파일 (전체 시트 + 가이드 탭) → 지사 폴더에 저장
+                bpath = os.path.join(bdir, f"0. {self._safe_name(bkr)}_전체.xlsx")   # 맨 위로 오도록 0. 접두
+                used_sheets = {"전체"}
+
+                def _uq(nm):
+                    nm = re.sub(r'[\\/*?:\[\]]', " ", str(nm)).strip()[:31] or "sheet"
+                    base = nm; k = 2
+                    while nm in used_sheets:
+                        nm = f"{base[:28]}_{k}"; k += 1
+                    used_sheets.add(nm)
+                    return nm
+
+                with pd.ExcelWriter(bpath, engine="openpyxl") as w:
+                    adf[branch_cols].rename(columns={"Review_Status": "Review Status"}).to_excel(w, sheet_name="전체", index=False)
+                    self._autofit(w.sheets["전체"])
+                    for g in sorted(adf["Main Guide"].unique()):
+                        gdf = self._guide_frame(adf[adf["Main Guide"] == g], guide_cols)
+                        sh = _uq(g)
+                        gdf.rename(columns={"Review_Status": "Review Status"}).to_excel(w, sheet_name=sh, index=False)
+                        self._autofit(w.sheets[sh])
+                n += 1
+                # 가이드별 개별 파일 → 지사 폴더에 저장 (엑셀 + PDF)
+                for g in sorted(adf["Main Guide"].unique()):
+                    gdf = self._guide_frame(adf[adf["Main Guide"] == g], guide_cols)
+                    self._write_sheet(os.path.join(bdir, f"{self._safe_name(g)}.xlsx"), gdf.rename(columns={"Review_Status": "Review Status"}), "리뷰")
+                    n += 1
+                    if self._write_guide_pdf(os.path.join(bdir, f"{self._safe_name(g)}.pdf"),
+                                             gdf, f"가이드: {g}  ·  {bkr}"):
+                        n += 1
+                # 지사 폴더 압축 (바로 전달용): 결과 루트에 {지사}.zip 생성
                 try:
-                    self.driver.execute_script("arguments[0].click();", a)
-                    clicked += 1
-                    time.sleep(0.03)
-                except:
+                    import shutil
+                    _zbase = os.path.join(root, self._safe_name(bkr))
+                    if os.path.exists(_zbase + ".zip"):
+                        os.remove(_zbase + ".zip")
+                    shutil.make_archive(_zbase, "zip", root_dir=root, base_dir=self._safe_name(bkr))
+                    self.log(f"  🗜 {bkr}.zip 생성")
+                except Exception as _e:
+                    self.log(f"  ⚠ {bkr} 압축 실패: {_e}")
+
+            self.log(f"  💾 저장 완료: {root}  (엑셀 {n}개)")
+            return root
+        except Exception as e:
+            self.log(f"  ⚠ 엑셀 저장 실패: {e}")
+            traceback.print_exc()
+            return None
+
+    def save_excel_dialog(self):
+        if self._result_df is None:
+            messagebox.showwarning("경고", "저장할 결과가 없습니다. 먼저 조회를 실행하세요.")
+            return
+        p = self.save_excel(self._result_df, ask=True)
+        if p:
+            messagebox.showinfo("성공", f"저장 완료:\n{p}")
+
+    def _build_copy_buttons(self):
+        for w in self.copy_btn_frame.winfo_children():
+            w.destroy()
+        Button(self.copy_btn_frame, text="📋 전체 Copy",
+               command=lambda: self._copy_text(self.last_report_text, "전체"),
+               bg="#9C27B0", fg="white").pack(side="left", padx=4)
+        for area in sorted(getattr(self, "_branch_texts", {}).keys(), key=area_rank):
+            bkr = AREA_KR.get(area, str(area))
+            Button(self.copy_btn_frame, text=f"{bkr} Copy",
+                   command=lambda a=area: self._copy_text(
+                       self._branch_texts.get(a, ""), AREA_KR.get(a, str(a)))
+                   ).pack(side="left", padx=3)
+
+    def _copy_text(self, text, label):
+        if not text or not str(text).strip():
+            messagebox.showwarning("경고", "복사할 내용이 없습니다. 먼저 조회하세요.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        messagebox.showinfo("복사됨", f"✅ [{label}] 결과를 클립보드에 복사했습니다.")
+
+    def _search_clear(self):
+        if hasattr(self, "search_var"):
+            self.search_var.set("")
+        self.result_text.delete(1.0, "end")
+        self.result_text.insert("end", self.last_report_text or "")
+        self.result_text.see("1.0")
+
+    def _search_guide(self):
+        q = self.search_var.get().strip()
+        self.result_text.delete(1.0, "end")
+        if not q:
+            self.result_text.insert("end", self.last_report_text or "")
+            self.result_text.see("1.0")
+            return
+        if self._result_df is None:
+            self.result_text.insert("end", "먼저 조회를 실행하세요.")
+            return
+
+        def _ravg(vals):
+            v = [float(x) for x in vals if str(x).replace('.', '', 1).isdigit()]
+            return (sum(v) / len(v)) if v else 0
+
+        sub = self._result_df[self._result_df["Main Guide"].astype(str).str.contains(q, case=False, na=False)]
+        if sub.empty:
+            self.result_text.insert("end", f"🔍 '{q}' 와 일치하는 가이드가 없습니다.")
+            return
+        L = []
+        for guide in sorted(sub["Main Guide"].unique()):
+            gsub = sub[sub["Main Guide"] == guide]
+            L.extend(self._summary_lines(gsub, f"가이드: {guide}"))
+            for area in sorted(gsub["Area"].unique(), key=area_rank):
+                asub = gsub[gsub["Area"] == area]
+                for date_val, ddf in asub.groupby(asub["Date"].dt.normalize()):
+                    L.append(f"\n  ── [{AREA_KR.get(area, str(area))}] "
+                             f"{pd.Timestamp(date_val).strftime('%Y-%m-%d (%a)')} ──")
+                    for product, g in ddf.groupby("Product"):
+                        teams = len(g); people = int(g["People"].sum())
+                        L.append(f"  • {product} / {teams}팀 {people}명")
+                        g5 = g[g["Agency"].isin(CHANNELS)]
+                        n5 = len(g5); c5 = int((g5["Check"] == "✓").sum())
+                        nAll = len(g); cAll = int((g["Check"] == "✓").sum())
+                        tavg = _ravg(g.loc[g["Check"].isin(["✓", "▲"]), "Rating"].tolist())
+                        roll = "      ▶ "
+                        if n5:
+                            roll += f"5채널 {c5}/{n5} ({c5/n5*100:.0f}%) · "
+                        roll += f"전체 {cAll}/{nAll} ({cAll/nAll*100:.0f}%)"
+                        if tavg:
+                            roll += f" · 평균 {tavg:.1f}"
+                        L.append(roll)
+                        for ch in CHANNELS:
+                            cg = g[g["Agency"] == ch]
+                            if len(cg) == 0:
+                                continue
+                            c = int((cg["Check"] == "✓").sum())
+                            L.append(f"      [{ch}] {c}/{len(cg)} ({c/len(cg)*100:.0f}%)")
+                            for _, r in cg.iterrows():
+                                code = r["Agency Code"]; rt = r["Rating"]
+                                if r["Check"] == "✓":
+                                    L.append(f"        ✓{code}({rt})")
+                                elif r["Check"] == "▲":
+                                    L.append(f"        ▲{code}({rt}) 낮은평점")
+                                else:
+                                    L.append(f"        ✗{code}")
+                        og = g[~g["Agency"].isin(CHANNELS)]
+                        for ag, gg in og.groupby("Agency"):
+                            L.append(f"      [{ag}] {len(gg)}팀 (개별확인): "
+                                     + ", ".join(gg["Agency Code"].tolist()))
+            L.append("")
+        self.result_text.insert("end", "\n".join(L))
+        self.result_text.see("1.0")
+
+    def copy_results(self):
+        txt = self.result_text.get(1.0, "end-1c")
+        if not txt.strip():
+            messagebox.showwarning("경고", "복사할 결과가 없습니다.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+        self.root.update()
+        messagebox.showinfo("성공", "✅ 전체 결과가 클립보드에 복사되었습니다.\n각 지사 섹션을 잘라 붙여넣기 하세요.")
+
+    # =========================================================
+    # Monthly / New Year Party  (간단 모드: 4~5점만, 리뷰내용 포함)
+    # =========================================================
+    def _run_dispatch(self):
+        m = self.mode_var.get()
+        if m == "PFP":
+            self.start_processing()
+        else:
+            self.start_processing_simple(m)
+
+    def collect_klook_simple(self, dfrom, dto, date_mode):
+        """L: date_type 서버필터(ReviewTime/ParticipantTime) + 4~5점 + 내용."""
+        reviews = {}
+        dtype = "ReviewTime" if date_mode == "review_date" else "ParticipantTime"
+        cap = self.capture_request(CHANNEL_META["L"]["page"], "review_list", wait=10)
+        if not cap:
+            self.log("  ⚠ [L] 캡처 실패"); return reviews
+        js = """
+        var cap=P[0], page=P[1], limit=P[2], dtype=P[3], sd=P[4], ed=P[5];
+        var u=new URL(cap.url, location.origin);
+        u.searchParams.set('date_type', dtype);
+        u.searchParams.set('start_date', sd);
+        u.searchParams.set('end_date', ed);
+        u.searchParams.set('stars','0');
+        u.searchParams.set('page', String(page));
+        u.searchParams.set('limit', String(limit));
+        var res=await fetch(u.toString(), {credentials:'include', headers:(cap.headers||{})});
+        var j=await res.json();
+        var list=(j.result&&j.result.review_list)||j.review_list||[];
+        var total=(j.result&&j.result.total)||null;
+        done({rows:list.map(function(x){return {code:x.booking_no, rating:x.stars, content:x.review||'', rdate:x.review_time};}), total:total});
+        """
+        # Klook은 요청 limit과 무관하게 페이지당 고정 개수를 주므로
+        # 'len<limit 종료'가 아니라 total 기준으로 끝까지 페이지네이션한다.
+        page, limit, total, got = 1, 50, None, 0
+        while page <= 4000:
+            r = self._fetch_page(js, cap, page, limit, dtype, dfrom, dto)
+            if not r or r.get("error"):
+                self.log(f"  ⚠ [L] p{page} 오류: {r.get('error') if r else 'no-resp'}"); break
+            rows = r.get("rows") or []
+            if total is None:
+                total = r.get("total")
+            if not rows:
+                break
+            for x in rows:
+                try:
+                    if float(x.get("rating")) < 0:
+                        continue
+                except (ValueError, TypeError):
                     continue
-            return clicked
-        except:
-            return 0
-
-    def _kkday_parse_reviewed_on(self, text):
-        return self._normalize_date_only(text)
-
-    def _kkday_count_stars(self, right_el):
-        try:
-            stars = right_el.find_elements(
-                By.XPATH,
-                './/p[contains(., "rating score")]/i['
-                'contains(concat(" ", normalize-space(@class), " "), " fa-star ") '
-                'and not(contains(concat(" ", normalize-space(@class), " "), " fa-star-o "))'
-                ']'
-            )
-            if stars is not None:
-                return str(len(stars))
-        except:
-            pass
-        return ""
-
-    def _kkday_get_booking_code(self, right_el):
-        try:
-            a = right_el.find_element(By.XPATH,
-                                      './/p[contains(., "Booking no.")]/a[contains(@href, "/v1/en/order/index/")]')
-            txt = (a.text or "").strip()
-            if txt.startswith("#"):
-                return txt[1:].strip()
-            return txt.strip()
-        except:
-            pass
-
-        try:
-            t = (right_el.text or "")
-            m = re.search(r'#([A-Za-z0-9]{6,})', t)
-            if m:
-                return m.group(1)
-        except:
-            pass
-        return ""
-
-    def _kkday_get_review_text(self, left_el):
-        title = ""
-        body_parts = []
-
-        try:
-            h4 = left_el.find_element(By.XPATH, './/h4')
-            title = (h4.text or "").strip()
-        except:
-            title = ""
-
-        try:
-            ps = left_el.find_elements(By.XPATH, './/div[contains(@class,"txt")]//p')
-            for p in ps:
-                t = (p.text or "").strip()
-                if t:
-                    body_parts.append(t)
-        except:
-            pass
-
-        body = "\n".join(body_parts).strip()
-        if title and body:
-            return f"{title}\n{body}"
-        if body:
-            return body
-        return title.strip()
-
-    def _kkday_collect_current_page_cards(self, reviews_dict):
-        new_count = 0
-        seen_count = 0
-
-        container_xpath = '//*[@id="defaultLayout"]/div/section[2]/div[2]/div[2]'
-        try:
-            container = WebDriverWait(self.driver, KKDAY_WAIT).until(
-                EC.presence_of_element_located((By.XPATH, container_xpath))
-            )
-        except:
-            return (0, 0)
-
-        candidates = container.find_elements(By.XPATH, './/div[contains(@class,"comment-left")]/..')
-        cards = []
-        for c in candidates:
-            try:
-                c.find_element(By.XPATH, './/div[contains(@class,"comment-right")]')
-                cards.append(c)
-            except:
-                continue
-
-        if not cards:
-            cards = container.find_elements(By.XPATH, './div/div/div')
-
-        for card in cards:
-            try:
-                left_el = None
-                right_el = None
-                try:
-                    left_el = card.find_element(By.XPATH, './/div[contains(@class,"comment-left")]')
-                except:
-                    left_el = None
-
-                try:
-                    right_el = card.find_element(By.XPATH, './/div[contains(@class,"comment-right") or contains(@class,"w-250")]')
-                except:
-                    right_el = None
-
-                if right_el is None:
-                    continue
-
-                code = self._kkday_get_booking_code(right_el)
+                code = norm_code(x.get("code"))
                 if not code:
                     continue
-
-                seen_count += 1
-
-                rating = self._kkday_count_stars(right_el)
-
-                review_date = ""
-                try:
-                    p = right_el.find_element(By.XPATH, './/p[contains(., "reviewed on")]')
-                    review_date = self._kkday_parse_reviewed_on((p.text or "").strip())
-                except:
-                    review_date = ""
-
-                review_text = ""
-                if left_el is not None:
-                    review_text = self._kkday_get_review_text(left_el)
-
-                if not review_text and left_el is not None:
-                    try:
-                        review_text = (left_el.text or "").strip()
-                    except:
-                        pass
-
-                is_new = code not in reviews_dict
-
-                reviews_dict[code] = {
-                    "rating": rating,
-                    "text": review_text,
-                    "review_date": review_date
-                }
-
-                if is_new:
-                    new_count += 1
-
-            except:
-                continue
-
-        return (new_count, seen_count)
-
-    def _kkday_go_next_page(self):
-        candidates = [
-            '//ul[contains(@class,"pagination")]//a[contains(., "Next") or contains(@aria-label,"Next")]',
-            '//a[@rel="next"]',
-            '//li[contains(@class,"next")]/a',
-            '//button[contains(., "Next")]',
-        ]
-        for xp in candidates:
-            try:
-                btn = self.driver.find_element(By.XPATH, xp)
-                cls = (btn.get_attribute("class") or "").lower()
-                aria = (btn.get_attribute("aria-disabled") or "").lower()
-                if "disabled" in cls or aria == "true":
-                    return False
-
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                time.sleep(0.15)
-                self.driver.execute_script("arguments[0].click();", btn)
-                time.sleep(0.8)
-                return True
-            except:
-                continue
-        return False
-
-    def _kkday_get_filter_signature(self):
-        sig = {"cb4": None, "cb5": None}
-        try:
-            cb5 = self.driver.find_element(By.ID, "scoreCheckbox_5")
-            cb4 = self.driver.find_element(By.ID, "scoreCheckbox_4")
-            sig["cb5"] = cb5.is_selected()
-            sig["cb4"] = cb4.is_selected()
-        except:
-            pass
-        return sig
-
-    def _kkday_filters_look_reset(self, sig):
-        try:
-            cb5 = self.driver.find_element(By.ID, "scoreCheckbox_5")
-            cb4 = self.driver.find_element(By.ID, "scoreCheckbox_4")
-            now = {"cb5": cb5.is_selected(), "cb4": cb4.is_selected()}
-            if sig.get("cb5") and not now.get("cb5"):
-                return True
-            if sig.get("cb4") and not now.get("cb4"):
-                return True
-        except:
-            return False
-        return False
-
-    def _kkday_restore_filters_and_search(self, start_date, end_date, sig, date_mode="participation"):
-        self._kkday_click_reset()
-        if date_mode == "review_date":
-            self._kkday_set_release_date_range(start_date, end_date)
-        else:
-            self._kkday_set_departure_date_range(start_date, end_date)
-        if sig.get("cb4") or sig.get("cb5"):
-            self._kkday_set_rating_4_5_only()
-        self._kkday_click_search()
-
-    # ============================================================
-    # GG (GetYourGuide)
-    # ============================================================
-    def collect_gg_reviews(self, start_date, end_date, date_mode="participation"):
-        reviews = {}
-
-        self.driver.get(GG_URL)
-        time.sleep(3)
-        print("  ✅ GG 리뷰 페이지 로드 완료")
-
-        if not self._gg_click_more_filters():
-            print("  ❌ GG More filters 클릭 실패")
-            return reviews
-
-        # ✅ 모드별 분기
-        if date_mode == "review_date":
-            # Review date는 -1일 보정 없이 그대로
-            if not self._gg_set_review_date(start_date, end_date):
-                print("  ❌ GG Review date 설정 실패")
-                return reviews
-        else:
-            # 기존 Activity date 로직 (-1일 보정 유지)
-            gg_start = start_date - timedelta(days=1)
-            if not self._gg_set_activity_date(gg_start, end_date):
-                print("  ❌ GG Activity date 설정 실패")
-                return reviews
-
-        if not self._gg_set_rating_4_5():
-            print("  ⚠ GG Rating 필터 설정 실패 (필터 없이 수집 진행)")
-
-        time.sleep(2)
-
-        page = 1
-        while page <= GG_MAX_PAGES:
-            if not self._gg_wait_cards_ready():
-                print(f"  ⚠ GG 페이지 {page}: 카드가 안 보임 → 종료")
+                reviews[code] = {"rating": self._fmt_rating(x.get("rating")),
+                                 "content": (x.get("content") or "").strip(),
+                                 "rdate": (x.get("rdate") or "")[:10]}
+            got += len(rows)
+            self.log(f"  → [L] p{page}: {len(rows)}행 (전체 {got}" + (f"/{total}" if total else "") + f" · 수집 누적 {len(reviews)})")
+            if total and got >= total:
                 break
-
-            new_count, seen_count = self._gg_collect_current_page_cards(reviews)
-            print(f"  페이지 {page}: 신규 {new_count}개 / 화면 {seen_count}개 (누적 {len(reviews)}개)")
-
-            if not self._gg_go_next_page():
-                print(f"  ✅ GG 페이지네이션 끝 (마지막 페이지: {page})")
-                break
-
             page += 1
-            time.sleep(1.0)
-
+            time.sleep(0.1)
         return reviews
 
-    def _gg_click_more_filters(self):
-        try:
-            btn = WebDriverWait(self.driver, GG_WAIT).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, '[data-testid="filters-toggle-second-row"]'))
-            )
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            time.sleep(0.3)
-            self.driver.execute_script("arguments[0].click();", btn)
-            time.sleep(1.0)
-            print("  ✅ GG More filters 클릭 완료")
-            return True
-        except Exception as e:
-            print(f"  ⚠ GG More filters 클릭 실패: {e}")
-            return False
-
-    def _gg_set_activity_date(self, start_date, end_date):
-        """기존: Activity date 설정 (참여 날짜 모드)"""
-        # ✅ Activity date input을 명확히 지목 (type="activityDateRange" 컨테이너로 한정)
-        selector = '[type="activityDateRange"] [data-testid="filters-date-range-selector"] input'
-        # 백업: 기존 셀렉터 (Activity date가 먼저 나오므로 이것도 잡힘)
-        fallback_selector = '[data-testid="filters-date-range-selector"] input'
-
-        return self._gg_set_date_range_generic(
-            start_date, end_date,
-            primary_selector=selector,
-            fallback_selector=fallback_selector,
-            label="Activity date"
-        )
-
-    def _gg_set_review_date(self, start_date, end_date):
-        """신규: Review date 설정 (리뷰 날짜 모드)"""
-        # ✅ type="reviewDateRange" 컨테이너로 한정
-        selector = '[type="reviewDateRange"] [data-testid="filters-date-range-selector"] input'
-
-        return self._gg_set_date_range_generic(
-            start_date, end_date,
-            primary_selector=selector,
-            fallback_selector=None,  # Review date는 백업 없음 (반드시 컨테이너로 한정해야 함)
-            label="Review date"
-        )
-
-    def _gg_set_date_range_generic(self, start_date, end_date, primary_selector, fallback_selector, label):
-        """GG 날짜 범위 설정 공통 로직"""
-        for attempt in range(3):
-            try:
-                print(f"  📌 GG {label} 설정 시도 {attempt + 1}/3")
-
-                # primary 시도
-                date_input = None
-                try:
-                    date_input = WebDriverWait(self.driver, GG_WAIT).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, primary_selector))
-                    )
-                except:
-                    if fallback_selector:
-                        date_input = WebDriverWait(self.driver, GG_WAIT).until(
-                            EC.element_to_be_clickable((By.CSS_SELECTOR, fallback_selector))
-                        )
-
-                if date_input is None:
-                    print(f"    ⚠ {label} input을 찾지 못함")
+    def collect_kkday_simple(self, dfrom, dto, date_mode):
+        """KK: begGoDate(참여)/begRecDate(리뷰작성) 서버필터 + recScores[4,5] + 내용."""
+        reviews = {}
+        cap = self.capture_request(CHANNEL_META["KK"]["page"], "get_comment_list", wait=10)
+        if not cap or not cap.get("body"):
+            self.log("  ⚠ [KK] 캡처 실패"); return reviews
+        rev = (date_mode == "review_date")
+        js = """
+        var cap=P[0], page=P[1], size=P[2], sd=P[3], ed=P[4], rev=P[5];
+        var body={}; try{ body=JSON.parse(cap.body)||{}; }catch(e){}
+        if(rev){ body.begRecDate=sd; body.endRecDate=ed; body.begGoDate=''; body.endGoDate=''; }
+        else { body.begGoDate=sd; body.endGoDate=ed; body.begRecDate=''; body.endRecDate=''; }
+        body.recScores=[1,2,3,4,5];
+        body.orderMid=''; body.prodOid=''; body.contactEmail=''; body.recImg='';
+        body.currentPage=page; body.pageSize=size;
+        var res=await fetch(cap.url,{method:'POST',credentials:'include',
+            headers:Object.assign({}, cap.headers||{}, {'Content-Type':'application/json'}),
+            body:JSON.stringify(body)});
+        var j=await res.json();
+        var rl=(j&&j.data&&j.data.recommandList)||[];
+        var total=(j&&j.data&&(j.data.size!==undefined?j.data.size:null));
+        done({rows:rl.map(function(x){return {code:x.orderMid, rating:x.recScore, title:x.recTitle||'', desc:x.recDesc||'', rdate:x.userRecDt||'', id:x.recOid};}), total:total});
+        """
+        page, size, seen, total = 1, 50, set(), None
+        while page <= 3000:
+            r = self._fetch_page(js, cap, page, size, dfrom, dto, rev)
+            if not r or r.get("error"):
+                self.log(f"  ⚠ [KK] p{page} 오류: {r.get('error') if r else 'no-resp'}"); break
+            if total is None:
+                total = r.get("total")
+            rows = r.get("rows") or []
+            if not rows:
+                break
+            for x in rows:
+                key = x.get("id") or x.get("code")
+                if key in seen:
                     continue
-
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", date_input)
-                time.sleep(0.3)
-                date_input.click()
-                time.sleep(1.0)
-
-                try:
-                    WebDriverWait(self.driver, GG_WAIT).until(
-                        EC.presence_of_element_located((By.ID, "date-range_panel"))
-                    )
-                except:
-                    date_input.click()
-                    time.sleep(1.0)
-
-                if not self._gg_navigate_and_click_day(start_date):
-                    print(f"    ⚠ FROM 날짜 ({start_date}) 클릭 실패")
+                seen.add(key)
+                code = norm_code(x.get("code"))
+                if not code:
                     continue
+                content = ((x.get("title") or "").strip() + "\n" + (x.get("desc") or "").strip()).strip()
+                reviews[code] = {"rating": self._fmt_rating(x.get("rating")),
+                                 "content": content,
+                                 "rdate": (x.get("rdate") or "")[:10]}
+            self.log(f"  → [KK] p{page}: {len(rows)}행 (누적 {len(reviews)}" + (f"/{total}" if total else "") + ")")
+            if total and len(seen) >= total:
+                break
+            if len(rows) < size:
+                break
+            page += 1
+            time.sleep(0.15)
+        return reviews
 
-                time.sleep(0.8)
-
-                # 패널이 닫혔으면 다시 열기
-                panel_still_open = True
+    def collect_gg_simple(self, dfrom, dto, date_mode):
+        """GG: travelDate(참여)/reviewDate(작성) 서버필터 + ratings[4,5] + 내용."""
+        reviews = {}
+        cap = self.capture_request(CHANNEL_META["GG"]["page"], "/graphql",
+                                   body_contains="bookingReference", wait=12)
+        if not cap or not cap.get("body"):
+            self.log("  ⚠ [GG] 캡처 실패"); return reviews
+        rev = (date_mode == "review_date")
+        # 참여일(활동일) 모드는 옛 도구와 동일하게 시작일 -1일 버퍼
+        sd = dfrom if rev else (pd.Timestamp(dfrom) - timedelta(days=1)).strftime("%Y-%m-%d")
+        ed = dto
+        js = """
+        var cap=P[0], off=P[1], size=P[2], sd=P[3], ed=P[4], rev=P[5];
+        var payload={}; try{ payload=JSON.parse(cap.body); }catch(e){}
+        payload.variables = payload.variables || {};
+        var inp = payload.variables.input || {};
+        if(rev){ inp.reviewDateFrom=sd; inp.reviewDateTo=ed; delete inp.travelDateFrom; delete inp.travelDateTo; }
+        else { inp.travelDateFrom=sd; inp.travelDateTo=ed; delete inp.reviewDateFrom; delete inp.reviewDateTo; }
+        inp.ratings=[1,2,3,4,5]; inp.limit=size; inp.offset=off;
+        payload.variables.input = inp;
+        var res=await fetch(cap.url,{method:'POST',credentials:'include',
+            headers:Object.assign({}, cap.headers||{}, {'Content-Type':'application/json',
+                'apollo-require-preflight':'true',
+                'x-apollo-operation-name':(payload.operationName||'Reviews_ReviewSearch')}),
+            body:JSON.stringify(payload)});
+        var txt=await res.text(); var j=null; try{ j=JSON.parse(txt); }catch(e){}
+        function findArr(o,d){ if(d>12||!o||typeof o!=='object')return null;
+          if(Array.isArray(o)&&o.length&&o[0]&&(o[0].bookingReference!==undefined||o[0].reviewId!==undefined))return o;
+          for(var k in o){var r=findArr(o[k],d+1); if(r)return r;} return null; }
+        var list=j?(findArr(j,0)||[]):[];
+        done({rows:list.map(function(x){return {code:x.bookingReference, rating:x.rating, content:x.comment||'', rdate:(x.createdAt||'').slice(0,10)};})});
+        """
+        page, size = 1, 50
+        while page <= 2000:
+            off = (page - 1) * size
+            r = self._fetch_page(js, cap, off, size, sd, ed, rev)
+            if not r or r.get("error"):
+                self.log(f"  ⚠ [GG] p{page} 오류: {r.get('error') if r else 'no-resp'}"); break
+            rows = r.get("rows") or []
+            if not rows:
+                break
+            for x in rows:
                 try:
-                    WebDriverWait(self.driver, 2).until(
-                        EC.presence_of_element_located((By.ID, "date-range_panel"))
-                    )
-                except:
-                    panel_still_open = False
-
-                if not panel_still_open:
-                    print("    ⚠ FROM 클릭 후 팝업이 닫힘 → 다시 열기")
-                    date_input.click()
-                    time.sleep(1.0)
-                    if not self._gg_navigate_and_click_day(start_date):
-                        print(f"    ⚠ FROM 재클릭 실패")
+                    if float(x.get("rating")) < 0:
                         continue
-                    time.sleep(0.8)
-
-                if not self._gg_navigate_and_click_day(end_date):
-                    print(f"    ⚠ TO 날짜 ({end_date}) 클릭 실패")
+                except (ValueError, TypeError):
                     continue
-
-                time.sleep(0.8)
-
-                # value 확인
-                value = self._gg_read_input_value(primary_selector, fallback_selector)
-                print(f"    📋 {label} input value: '{value}'")
-
-                if " - " in (value or ""):
-                    print(f"  ✅ GG {label} 설정 완료: {value}")
-                    self._gg_close_date_panel()
-                    return True
-                else:
-                    print(f"    ⚠ value에 범위가 없음 → retry")
-                    self._gg_close_date_panel()
-                    time.sleep(0.5)
+                code = norm_code(x.get("code"))
+                if not code:
                     continue
+                reviews[code] = {"rating": self._fmt_rating(x.get("rating")),
+                                 "content": (x.get("content") or "").strip(),
+                                 "rdate": (x.get("rdate") or "")[:10]}
+            self.log(f"  → [GG] p{page}: {len(rows)}행 (누적 {len(reviews)})")
+            if len(rows) < size:
+                break
+            page += 1
+            time.sleep(0.2)
+        return reviews
 
-            except Exception as e:
-                print(f"    ⚠ GG {label} 시도 {attempt + 1} 실패: {e}")
-                continue
-
-        print(f"  ❌ GG {label} 설정 3회 모두 실패")
-        return False
-
-    def _gg_read_input_value(self, primary_selector, fallback_selector):
-        """현재 날짜 input의 value 읽기"""
-        for sel in [primary_selector, fallback_selector]:
-            if not sel:
-                continue
-            try:
-                inp = self.driver.find_element(By.CSS_SELECTOR, sel)
-                val = (inp.get_attribute("value") or "").strip()
-                if val:
-                    return val
-            except:
-                continue
-        return ""
-
-    def _gg_close_date_panel(self):
-        try:
-            from selenium.webdriver.common.keys import Keys as K
-            # 마지막으로 사용한 input 기준으로 ESC 보내기 (가능한 셀렉터 모두 시도)
-            for sel in [
-                '[type="reviewDateRange"] [data-testid="filters-date-range-selector"] input',
-                '[type="activityDateRange"] [data-testid="filters-date-range-selector"] input',
-                '[data-testid="filters-date-range-selector"] input',
-            ]:
-                try:
-                    el = self.driver.find_element(By.CSS_SELECTOR, sel)
-                    el.send_keys(K.ESCAPE)
-                    time.sleep(0.2)
-                    break
-                except:
-                    continue
-        except:
-            pass
-        try:
-            self.driver.execute_script("document.querySelector('main').click();")
-            time.sleep(0.3)
-        except:
-            pass
-
-    def _gg_get_current_calendar_month_year(self):
-        month_names = ["january", "february", "march", "april", "may", "june",
-                       "july", "august", "september", "october", "november", "december"]
-        try:
-            panel = self.driver.find_element(By.ID, "date-range_panel")
-
-            month_btn = panel.find_element(By.CSS_SELECTOR, 'button.p-datepicker-select-month')
-            month_text = (month_btn.text or "").strip().lower()
-
-            month_idx = None
-            for i, mn in enumerate(month_names):
-                if mn == month_text:
-                    month_idx = i
-                    break
-
-            year_btn = panel.find_element(By.CSS_SELECTOR, 'button.p-datepicker-select-year')
-            year_text = (year_btn.text or "").strip()
-            year = int(year_text)
-
-            print(f"      📅 현재 달력: {month_text} {year} (month_idx={month_idx})")
-            return month_idx, year
-        except Exception as e:
-            print(f"    ⚠ GG 달력 월/연도 읽기 실패: {e}")
-            return None, None
-
-    def _gg_click_calendar_prev(self):
-        try:
-            panel = self.driver.find_element(By.ID, "date-range_panel")
-            try:
-                btn = panel.find_element(By.XPATH, './/button[@aria-label="Previous Month"]')
-                self.driver.execute_script("arguments[0].click();", btn)
-                time.sleep(0.35)
-                return True
-            except:
-                pass
-            try:
-                btn = panel.find_element(By.CSS_SELECTOR, '.p-datepicker-prev')
-                self.driver.execute_script("arguments[0].click();", btn)
-                time.sleep(0.35)
-                return True
-            except:
-                pass
-            return False
-        except:
-            return False
-
-    def _gg_click_calendar_next(self):
-        try:
-            panel = self.driver.find_element(By.ID, "date-range_panel")
-            try:
-                btn = panel.find_element(By.XPATH, './/button[@aria-label="Next Month"]')
-                self.driver.execute_script("arguments[0].click();", btn)
-                time.sleep(0.35)
-                return True
-            except:
-                pass
-            try:
-                btn = panel.find_element(By.CSS_SELECTOR, '.p-datepicker-next')
-                self.driver.execute_script("arguments[0].click();", btn)
-                time.sleep(0.35)
-                return True
-            except:
-                pass
-            return False
-        except:
-            return False
-
-    def _gg_navigate_and_click_day(self, target_date):
-        print(f"    🎯 target: {target_date.year}-{target_date.month:02d}-{target_date.day:02d}")
-        prev_ym = None
-        stuck_count = 0
-
-        for _ in range(30):
-            cur_month, cur_year = self._gg_get_current_calendar_month_year()
-            if cur_month is None or cur_year is None:
-                time.sleep(0.4)
-                continue
-
-            cur_ym = (cur_year, cur_month)
-
-            if cur_ym == prev_ym:
-                stuck_count += 1
-                if stuck_count >= 3:
-                    return False
-            else:
-                stuck_count = 0
-            prev_ym = cur_ym
-
-            if cur_month == (target_date.month - 1) and cur_year == target_date.year:
-                return self._gg_click_day_cell(target_date.day)
-
-            cur_ym_int = cur_year * 12 + cur_month
-            target_ym_int = target_date.year * 12 + (target_date.month - 1)
-
-            if target_ym_int > cur_ym_int:
-                self._gg_click_calendar_next()
-            else:
-                self._gg_click_calendar_prev()
-
-        return False
-
-    def _gg_click_day_cell(self, day: int):
-        try:
-            panel = self.driver.find_element(By.ID, "date-range_panel")
-            day_cells = panel.find_elements(By.CSS_SELECTOR, 'span.p-datepicker-day')
-
-            for cell in day_cells:
-                cell_text = (cell.text or "").strip()
-                if cell_text != str(day):
-                    continue
-
-                disabled = (cell.get_attribute("aria-disabled") or "").lower()
-                if disabled == "true":
-                    continue
-
-                try:
-                    parent_td = cell.find_element(By.XPATH, './..')
-                    parent_cls = (parent_td.get_attribute("class") or "").lower()
-                    if "other-month" in parent_cls or "outside" in parent_cls:
-                        continue
-                except:
-                    pass
-
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cell)
-                time.sleep(0.15)
-                self.driver.execute_script("arguments[0].click();", cell)
-                time.sleep(0.5)
-                return True
-
-            return False
-        except:
-            return False
-
-    def _gg_set_rating_4_5(self):
-        try:
-            rating_dropdown = WebDriverWait(self.driver, GG_WAIT).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, '[data-testid="filter-chip-selector-dropdown-rating"]'))
-            )
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", rating_dropdown)
-            time.sleep(0.3)
-            rating_dropdown.click()
-            time.sleep(1.0)
-
-            options = self.driver.find_elements(By.CSS_SELECTOR, 'li.p-multiselect-option, [role="option"]')
-
-            for opt in options:
-                opt_text = (opt.text or "").strip()
-                if opt_text in ["4", "5"] or opt_text.startswith("4 ") or opt_text.startswith("5 "):
+    def collect_ctrip_simple(self, dfrom, dto, date_mode):
+        """TPC: 작성일 정렬 페이지네이션 + 클라 필터(참여=departureTime / 작성=commentTime) + 4~5점."""
+        reviews = {}
+        cap = self.capture_request(CHANNEL_META["TPC"]["page"], "listOrderComments", wait=10)
+        if not cap:
+            self.log("  ⚠ [TPC] 캡처 실패"); return reviews
+        rev = (date_mode == "review_date")
+        js = """
+        var cap=P[0], page=P[1], size=P[2];
+        var body={sceneInfo:{bizScene:'ACTIVITY'}, paging:{pageNo:page, pageSize:size},
+                  sorting:{orderBy:'COMMENT_TIME', desc:true}};
+        try{ var b=JSON.parse(cap.body); if(b&&b.sceneInfo){ body.sceneInfo=b.sceneInfo; } }catch(e){}
+        var res=await fetch(cap.url,{method:'POST',credentials:'include',
+            headers:Object.assign({}, cap.headers||{}, {'Content-Type':'application/json'}),
+            body:JSON.stringify(body)});
+        var j=await res.json();
+        var list=j.comments||[];
+        done({rows:list.map(function(x){return {code:String(x.orderId), rating:x.score, content:x.content||'',
+              ctime:x.commentTime, dtime:(x.orderInfo&&x.orderInfo.departureTime)||null};})});
+        """
+        lo = to_epoch_ms(pd.Timestamp(dfrom))
+        hi = to_epoch_ms(pd.Timestamp(dto) + timedelta(days=1)) - 1
+        stop_ms = to_epoch_ms(pd.Timestamp(dfrom) - timedelta(days=(1 if rev else 60)))
+        page, size = 1, 50
+        while page <= 3000:
+            r = self._fetch_page(js, cap, page, size)
+            if not r or r.get("error"):
+                self.log(f"  ⚠ [TPC] p{page} 오류: {r.get('error') if r else 'no-resp'}"); break
+            rows = r.get("rows") or []
+            if not rows:
+                break
+            oldest_ok = True
+            for x in rows:
+                ct = self._to_ms(x.get("ctime"))
+                dt = self._to_ms(x.get("dtime"))
+                basis = ct if rev else dt
+                if basis is not None and (lo <= basis <= hi):
                     try:
-                        is_selected = False
-                        try:
-                            cb_input = opt.find_element(By.CSS_SELECTOR, 'input[type="checkbox"]')
-                            is_selected = cb_input.is_selected()
-                        except:
-                            aria_sel = (opt.get_attribute("aria-selected") or "").lower()
-                            is_selected = aria_sel == "true"
-
-                        if not is_selected:
-                            self.driver.execute_script("arguments[0].click();", opt)
-                            time.sleep(0.2)
-                    except:
-                        continue
-
-            try:
-                self.driver.find_element(By.TAG_NAME, 'body').click()
-            except:
-                pass
-            time.sleep(0.5)
-            return True
-
-        except Exception as e:
-            print(f"  ⚠ GG Rating 필터 실패: {e}")
-            return False
-
-    def _gg_wait_cards_ready(self):
-        try:
-            WebDriverWait(self.driver, GG_WAIT).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="review-card"]'))
-            )
-            return True
-        except:
-            return False
-
-    def _gg_collect_current_page_cards(self, reviews_dict):
-        new_count = 0
-        seen_count = 0
-
-        cards = self.driver.find_elements(By.CSS_SELECTOR, '[data-testid="review-card"]')
-        if not cards:
-            return (0, 0)
-
-        for card in cards:
-            try:
-                rating = self._gg_extract_rating(card)
-                review_text = self._gg_extract_review_text(card)
-                review_date = self._gg_extract_review_date(card)
-                booking_code = self._gg_extract_booking_code(card)
-                if not booking_code:
-                    continue
-
-                seen_count += 1
-                is_new = booking_code not in reviews_dict
-
-                reviews_dict[booking_code] = {
-                    "rating": rating,
-                    "text": review_text,
-                    "review_date": review_date
-                }
-
-                if is_new:
-                    new_count += 1
-
-            except:
-                continue
-
-        return (new_count, seen_count)
-
-    def _gg_extract_rating(self, card):
-        try:
-            rating_el = card.find_element(By.CSS_SELECTOR, '.c-user-rating__rating')
-            return (rating_el.text or "").strip()
-        except:
-            return ""
-
-    def _gg_extract_review_text(self, card):
-        try:
-            comment_el = card.find_element(By.CSS_SELECTOR, '[data-testid="review-card-comment"]')
-            return (comment_el.text or "").strip()
-        except:
-            return ""
-
-    def _gg_extract_review_date(self, card):
-        try:
-            date_el = None
-            candidates = card.find_elements(By.CSS_SELECTOR, 'div.absolute')
-            for el in candidates:
-                cls = (el.get_attribute("class") or "")
-                if "right-4" in cls and "top-4" in cls:
-                    date_el = el
-                    break
-
-            if date_el is None:
-                card_text = card.text or ""
-                return self._gg_parse_date_text(card_text)
-
-            date_text = (date_el.text or "").strip()
-            return self._gg_parse_date_text(date_text)
-        except:
-            return ""
-
-    def _gg_parse_date_text(self, text):
-        if not text:
-            return ""
-
-        month_map = {
-            "jan": "01", "feb": "02", "mar": "03", "apr": "04",
-            "may": "05", "jun": "06", "jul": "07", "aug": "08",
-            "sep": "09", "oct": "10", "nov": "11", "dec": "12",
-            "january": "01", "february": "02", "march": "03", "april": "04",
-            "june": "06", "july": "07", "august": "08",
-            "september": "09", "october": "10", "november": "11", "december": "12"
-        }
-
-        m = re.search(r'(\w+)\s+(\d{1,2}),?\s+(\d{4})', text)
-        if not m:
-            return ""
-
-        month_str = m.group(1).lower()
-        day = int(m.group(2))
-        year = int(m.group(3))
-
-        month_code = month_map.get(month_str) or month_map.get(month_str[:3])
-        if not month_code:
-            return ""
-
-        return f"{year}-{month_code}-{day:02d}"
-
-    def _gg_extract_booking_code(self, card):
-        code = self._gg_read_booking_reference(card)
-        if code:
-            return code
-
-        try:
-            expand_btn = card.find_element(By.CSS_SELECTOR, '[data-testid="review-card-expand"]')
-            btn_text = (expand_btn.text or "").strip().lower()
-            if "show details" in btn_text:
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", expand_btn)
-                time.sleep(0.2)
-                self.driver.execute_script("arguments[0].click();", expand_btn)
-                time.sleep(0.6)
-        except:
-            pass
-
-        code = self._gg_read_booking_reference(card)
-        return code
-
-    def _gg_read_booking_reference(self, card):
-        try:
-            ref_link = card.find_element(By.CSS_SELECTOR, '[data-testid="Booking reference-link"]')
-            code = (ref_link.text or "").strip()
-            return code if code else ""
-        except:
-            try:
-                li = card.find_element(By.CSS_SELECTOR, 'li[data-testid="Booking reference"]')
-                full_text = (li.text or "").strip()
-                parts = full_text.split()
-                code_candidates = [p for p in parts if re.match(r'^[A-Z0-9]{6,}$', p)]
-                if code_candidates:
-                    return code_candidates[-1]
-            except:
-                pass
-            return ""
-
-    def _gg_go_next_page(self):
-        try:
-            next_btns = self.driver.find_elements(By.CSS_SELECTOR, 'button[data-pc-section="next"]')
-            for btn in next_btns:
-                is_disabled = btn.get_attribute("disabled")
-                if is_disabled:
-                    continue
-                cls = (btn.get_attribute("class") or "").lower()
-                if "p-disabled" in cls or "disabled" in cls:
-                    continue
-
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                time.sleep(0.2)
-                self.driver.execute_script("arguments[0].click();", btn)
-                time.sleep(1.5)
-                return True
-            return False
-        except:
-            return False
-
-    # ============================================================
-    # Excel: 리뷰 있는 것만 저장
-    # ============================================================
-    def create_excel_output_reviews_only(self, period_df, all_reviews, start_date, end_date,
-                                          selected_areas=None, date_mode="participation"):
-        print("\n📊 엑셀 파일 생성(리뷰 있는 것만) 중...")
-
-        matched = []
-        for _, row in period_df.iterrows():
-            agency = str(row.get('Agency', '')).strip()
-            code = str(row.get('Agency Code', '')).strip()
-
-            info = all_reviews.get(agency, {}).get(code)
-            if not info:
-                continue
-
-            rating = (info.get('rating') or "").strip()
-            review_text = (info.get('text') or "").strip()
-            review_date = (info.get('review_date') or "").strip()
-
-            if not (rating or review_text or review_date):
-                continue
-
-            matched.append({
-                'Tour Date': self._normalize_date_only(row.get('Date', '')),
-                'Review Date': review_date,
-                'Agency Code': code,
-                'Tour': row.get('Product', ''),
-                'Star': rating,
-                'Review': review_text,
-                'Guide': row.get('Main Guide', ''),
-                'Area': row.get('Area', ''),
-                'Agency': agency
-            })
-
-        matched_df = pd.DataFrame(matched)
-
-        if not matched_df.empty:
-            def _agency_rank(a):
-                a = str(a).strip()
-                return {"L": 0, "KK": 1, "GG": 2}.get(a, 9)
-
-            def _star_rank(s):
-                try:
-                    v = int(str(s).strip())
-                except:
-                    v = -1
-                return {5: 0, 4: 1}.get(v, 9)
-
-            matched_df["__agency_rank"] = matched_df["Agency"].apply(_agency_rank)
-            matched_df["__star_rank"] = matched_df["Star"].apply(_star_rank)
-
-            matched_df["Review Date"] = matched_df["Review Date"].apply(self._normalize_date_only)
-
-            matched_df = matched_df.sort_values(
-                by=["Tour Date", "__agency_rank", "__star_rank", "Agency Code"],
-                ascending=[True, True, True, True],
-                na_position="last"
-            ).drop(columns=["__agency_rank", "__star_rank"])
-
-        # ✅ 파일명에 모드 표시 (리뷰 vs 참여)
-        mode_tag = "RD" if date_mode == "review_date" else "PD"  # RD=ReviewDate, PD=ParticipationDate
-        output_filename = f"Review_{mode_tag}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
-
-        with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
-            areas_to_make = selected_areas if selected_areas else AREAS
-            if matched_df.empty:
-                tmp = pd.DataFrame([{
-                    "Message": "No reviews matched. Check: filters / login / date range / selectors."
-                }])
-                tmp.to_excel(writer, sheet_name="NoReviews", index=False)
-                return output_filename
-
-            for area in areas_to_make:
-                area_df = matched_df[matched_df['Area'] == area].copy()
-                if area_df.empty:
-                    continue
-
-                out_df = area_df.drop(columns=['Area'])
-                out_df.to_excel(writer, sheet_name=area, index=False)
-                ws = writer.sheets[area]
-                self.adjust_column_width(ws)
-                print(f"  ✅ {area}: {len(area_df)}개")
-
-            self.create_guide_sheet_original_style(writer, matched_df, period_df, areas_to_make)
-            print("  ✅ Guide 시트 생성")
-
-        return output_filename
-
-    def adjust_column_width(self, worksheet):
-        for column in worksheet.columns:
-            column_letter = get_column_letter(column[0].column)
-            column_name = worksheet[f"{column_letter}1"].value
-
-            if column_name == 'Review':
-                worksheet.column_dimensions[column_letter].width = 80
-                for cell in column:
-                    cell.alignment = Alignment(wrap_text=True, horizontal='left', vertical='top')
-            else:
-                max_length = 0
-                for cell in column:
-                    try:
-                        max_length = max(max_length, len(str(cell.value)))
-                    except:
+                        if float(x.get("rating")) >= 0:
+                            code = norm_code(x.get("code"))
+                            if code and code != "0":
+                                rd = pd.Timestamp(ct, unit="ms").strftime("%Y-%m-%d") if ct else ""
+                                reviews[code] = {"rating": self._fmt_rating(x.get("rating")),
+                                                 "content": (x.get("content") or "").strip(),
+                                                 "rdate": rd}
+                    except (ValueError, TypeError):
                         pass
-                worksheet.column_dimensions[column_letter].width = min((max_length + 2) * 1.2, 30)
-                for cell in column:
-                    cell.alignment = Alignment(horizontal='left', vertical='top')
+                if ct is not None and ct < stop_ms:
+                    oldest_ok = False
+            self.log(f"  → [TPC] p{page}: {len(rows)}행 (누적 {len(reviews)})")
+            if not oldest_ok:
+                break
+            page += 1
+            time.sleep(0.12)
+        return reviews
 
-        for cell in worksheet[1]:
-            cell.font = Font(bold=True)
-            cell.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
+    def collect_mrt_simple(self, dfrom, dto, date_mode):
+        """MRT: 전체 페이지네이션 + 클라 필터(참여=travelStartDate / 작성=createdAt) + 4~5점."""
+        reviews = {}
+        self.driver.get(CHANNEL_META["MRT"]["page"])
+        time.sleep(3)
+        rev = (date_mode == "review_date")
+        js = """
+        var page=P[0], size=P[1];
+        var tok=localStorage.getItem('accessToken');
+        var res=await fetch('https://api3-backoffice.myrealtrip.com/review/partner/reviews/search',
+            {method:'POST', credentials:'include',
+             headers:{'Content-Type':'application/json','partner-access-token':tok},
+             body:JSON.stringify({page:page, pageSize:size})});
+        var j=await res.json();
+        var list=Array.isArray(j.data)?j.data:[];
+        done({rows:list.map(function(x){return {code:x.reservationNo, rating:x.score, content:x.comment||'',
+              rdate:x.createdAt, tdate:x.travelStartDate};})});
+        """
+        page, size = 1, 50
+        while page <= 3000:
+            r = self._fetch_page(js, page, size)
+            if not r or r.get("error"):
+                self.log(f"  ⚠ [MRT] p{page} 오류: {r.get('error') if r else 'no-resp'}"); break
+            rows = r.get("rows") or []
+            if not rows:
+                break
+            for x in rows:
+                basis = (x.get("rdate") or "")[:10] if rev else (x.get("tdate") or "")[:10]
+                if not basis or not (dfrom <= basis <= dto):
+                    continue
+                try:
+                    if float(x.get("rating")) < 0:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                code = norm_code(x.get("code"))
+                if not code:
+                    continue
+                reviews[code] = {"rating": self._fmt_rating(x.get("rating")),
+                                 "content": (x.get("content") or "").strip(),
+                                 "rdate": (x.get("rdate") or "")[:10]}
+            self.log(f"  → [MRT] p{page}: {len(rows)}행 (누적 {len(reviews)})")
+            if len(rows) < size:
+                break
+            page += 1
+            time.sleep(0.15)
+        return reviews
+
+    def start_processing_simple(self, mode):
+        if not self.driver:
+            messagebox.showerror("오류", "먼저 크롬을 연결하세요!"); return
+        if getattr(self, "df_simple", None) is None:
+            messagebox.showerror("오류", "먼저 엑셀을 선택하세요!"); return
+        sel_branches = self._selected_branches()
+        if not sel_branches:
+            messagebox.showerror("오류", "최소 1개 지사를 선택하세요!"); return
+        d1 = self._get_date(self.start_date_widget)
+        d2 = self._get_date(self.end_date_widget)
+        if d1 is None or d2 is None:
+            messagebox.showerror("오류", "기간(시작일/종료일)을 확인하세요!"); return
+        if d1 > d2:
+            messagebox.showerror("오류", "시작일이 종료일보다 늦습니다!"); return
+
+        date_mode = "review_date"   # Monthly·NYP 모두 리뷰 작성일 기준
+        mode_name = {"MONTHLY": "Monthly", "QUARTERLY": "Quarterly", "NYP": "New Year Party"}[mode]
+        report_min = pd.Timestamp(d1).normalize()
+        report_max = pd.Timestamp(d2).normalize()
+        dfrom = report_min.strftime("%Y-%m-%d")
+        dto = report_max.strftime("%Y-%m-%d")
+
+        # Monthly/NYP: No Show 포함 · 스페셜 제외 · 전체 가이드 · 기간 범위
+        # 팀/투어 분모는 리뷰 수집 가능한 5개 채널 예약만 (L/KK/GG/TPC/MRT)
+        res_df = self.df_simple[
+            (self.df_simple["Date"].dt.normalize() >= report_min)
+            & (self.df_simple["Date"].dt.normalize() <= report_max)
+            & (self.df_simple["Area"].isin(sel_branches))
+            & (self.df_simple["Agency"].isin(CHANNELS))
+        ].copy()
+        if res_df.empty:
+            messagebox.showerror("오류", "선택 조건에 해당하는 예약이 없습니다."); return
+
+        try:
+            self.detail_lines = []
+            self.result_text.delete(1.0, "end")
+            basis_kr = "리뷰작성일" if date_mode == "review_date" else "참여일"
+            self.log(f"📊 {mode_name} 리뷰 크롤링 시작 (1~5점 전체 수집 · {basis_kr} 기준)")
+            self.log(f"📅 기간: {dfrom} ~ {dto} · 지사 {res_df['Area'].nunique()}개 · 예약 {len(res_df)}건")
+            self.log("=" * 70)
+
+            pw = self.create_progress_window()
+            used = [c for c in CHANNELS if c in set(res_df["Agency"])]
+            collectors = {
+                "L": lambda: self.collect_klook_simple(dfrom, dto, date_mode),
+                "KK": lambda: self.collect_kkday_simple(dfrom, dto, date_mode),
+                "GG": lambda: self.collect_gg_simple(dfrom, dto, date_mode),
+                "TPC": lambda: self.collect_ctrip_simple(dfrom, dto, date_mode),
+                "MRT": lambda: self.collect_mrt_simple(dfrom, dto, date_mode),
+            }
+            collected = {}
+            for i, ch in enumerate(used):
+                pw.label.config(text=f"[{ch}] {CHANNEL_META[ch]['name']} 리뷰 수집 중...")
+                pw.progress_bar["value"] = (i / max(len(used), 1)) * 100
+                pw.window.update()
+                self.log(f"\n🔍 [{ch}] {CHANNEL_META[ch]['name']}")
+                try:
+                    collected[ch] = collectors[ch]()
+                    self.log(f"  ✓ [{ch}] {len(collected[ch])}건 수집")
+                except Exception as e:
+                    collected[ch] = {}
+                    self.log(f"  ✗ [{ch}] 실패: {e}")
+                    traceback.print_exc()
+            pw.window.destroy()
+
+            rows = []
+            for _, r in res_df.iterrows():
+                ch = r["Agency"]
+                code = norm_code(r["Agency Code"])
+                info = collected.get(ch, {}).get(code)
+                if not info:
+                    continue
+                rows.append({
+                    "Tour Date": pd.Timestamp(r["Date"]).strftime("%Y-%m-%d"),
+                    "Review Date": info.get("rdate", ""),
+                    "Agency Code": code,
+                    "Tour": r.get("Product", ""),
+                    "Star": info.get("rating", ""),
+                    "Review": info.get("content", ""),
+                    "Guide": r.get("Main Guide", ""),
+                    "Area": r.get("Area", ""),
+                    "Agency": ch,
+                })
+            matched_df = pd.DataFrame(rows)
+
+            saved = self.save_excel_simple(matched_df, res_df, sel_branches, mode_name, dfrom, dto)
+
+            self.log("\n" + "=" * 70)
+            self.log(f"✅ {mode_name} 완료 · 매칭 {len(matched_df)}건")
+            for area in sorted(set(sel_branches), key=area_rank):
+                n = len(matched_df[matched_df["Area"] == area]) if not matched_df.empty else 0
+                t = len(res_df[res_df["Area"] == area])
+                self.log(f"  · {AREA_KR.get(area, area)}: 리뷰 {n} / 예약 {t}")
+            self.progress_var.set("✅ 완료" + (f" · 저장: {os.path.basename(saved)}" if saved else ""))
+            messagebox.showinfo("완료", f"{mode_name} 리뷰 크롤링 완료!\n\n엑셀 저장:\n{saved}")
+        except Exception as e:
+            self.progress_var.set(f"❌ 오류: {e}")
+            self.log(f"오류: {e}")
+            traceback.print_exc()
+            messagebox.showerror("오류", f"처리 중 오류:\n{e}")
 
     @staticmethod
-    def _split_guide_names(raw_value):
-        if raw_value is None:
-            return []
-        names = [n.strip() for n in str(raw_value).split(",")]
-        return [n for n in names if n != ""]
+    def _autofit_simple(ws):
+        from openpyxl.styles import Alignment
+        from openpyxl.utils import get_column_letter
+        for col in ws.columns:
+            letter = get_column_letter(col[0].column)
+            header = ws.cell(row=1, column=col[0].column).value
+            if header == "Review":
+                ws.column_dimensions[letter].width = 80
+                for cell in col:
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+            else:
+                m = 0
+                for cell in col:
+                    v = cell.value
+                    if v is None:
+                        continue
+                    w = sum(2 if ord(ch) > 127 else 1 for ch in str(v))
+                    if w > m:
+                        m = w
+                ws.column_dimensions[letter].width = min(max(m + 2, 8), 40)
 
-    def create_guide_sheet_original_style(self, writer, matched_df, reservation_period_df, areas_to_make):
-        book = writer.book
-        if "Guide" in book.sheetnames:
-            del book["Guide"]
-        book.create_sheet("Guide")
-        ws = book["Guide"]
+    def save_excel_simple(self, matched_df, res_df, areas, mode_name, dfrom, dto):
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        tag = dfrom.replace("-", "") + "-" + dto.replace("-", "")
+        fname = f"{mode_name} Review Crawling {tag}.xlsx"
+        path = os.path.join(SCRIPT_DIR, fname)
+        from openpyxl.styles import Alignment
+        _center = Alignment(horizontal="center", vertical="center")
+        wb = Workbook(); wb.remove(wb.active)
+        cols = ["Tour Date", "Review Date", "Agency Code", "Tour", "Star", "Review", "Guide", "Agency"]
 
-        start_col = 1
-        for area in areas_to_make:
-            area_reviews = matched_df[matched_df['Area'] == area]
-            area_res = reservation_period_df[reservation_period_df['Area'] == area]
-            if area_res.empty:
-                continue
+        def _arank(a):
+            return {"L": 0, "KK": 1, "GG": 2, "TPC": 3, "MRT": 4}.get(str(a).strip(), 9)
 
-            c = ws.cell(row=1, column=start_col, value=area)
-            c.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-            c.font = Font(bold=True, color="FFFFFF", size=12)
-
-            headers = ["Guide Name", "Review Count", "Tour Count", "Team Count", "Review %"]
-            for i, h in enumerate(headers):
-                cc = ws.cell(row=2, column=start_col + i, value=h)
-                cc.font = Font(bold=True)
-                cc.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
-
-            all_guide_names = set()
-            for raw in area_res['Main Guide'].dropna():
-                for name in self._split_guide_names(raw):
-                    all_guide_names.add(name)
-
-            stats = []
-            for guide in all_guide_names:
-                review_count = area_reviews['Guide'].apply(
-                    lambda val: guide in self._split_guide_names(val)
-                ).sum()
-
-                mask = area_res['Main Guide'].apply(
-                    lambda val: guide in self._split_guide_names(val)
-                )
-                g_res = area_res[mask]
-
-                team_count = len(g_res)
-                tour_count = g_res['Date'].nunique()
-                review_pct = (review_count / team_count) if team_count > 0 else 0
-
-                stats.append({
-                    "guide": guide,
-                    "review_count": int(review_count),
-                    "tour_count": int(tour_count),
-                    "team_count": int(team_count),
-                    "review_pct": review_pct
-                })
-
-            stats.sort(key=lambda x: (x["review_count"], x["team_count"]), reverse=True)
-
-            r = 3
-            for s in stats:
-                ws.cell(row=r, column=start_col, value=s["guide"])
-                ws.cell(row=r, column=start_col + 1, value=s["review_count"])
-                ws.cell(row=r, column=start_col + 2, value=s["tour_count"])
-                ws.cell(row=r, column=start_col + 3, value=s["team_count"])
-
-                pct_cell = ws.cell(row=r, column=start_col + 4, value=s["review_pct"])
-                pct_cell.number_format = '0.00%'
-                r += 1
-
-            for col_idx in range(start_col, start_col + 5):
-                ws.column_dimensions[get_column_letter(col_idx)].width = 15
-
-            start_col += 6
-
-    # ============================================================
-    # ✅ 예약 파일 없을 때: 기존 Guide Team/Tour 유지 + Review Count/%만 업데이트
-    # ============================================================
-    def _read_reviews_from_workbook(self, wb, review_sheets):
-        rows = []
-        for sheet_name in review_sheets:
-            ws = wb[sheet_name]
-            headers = [cell.value for cell in ws[1]]
-            header_map = {str(h).strip(): idx for idx, h in enumerate(headers) if h is not None}
-
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                if not any(row):
-                    continue
-                def g(col):
-                    i = header_map.get(col)
-                    return row[i] if i is not None and i < len(row) else None
-
-                guide_val = g("Guide")
-                rows.append({
-                    "Area": sheet_name,
-                    "Guide": guide_val,
-                })
-
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-        df["Area"] = df["Area"].astype(str).str.strip()
-        df["Guide"] = df["Guide"].fillna("").astype(str).str.strip()
-        df = df[df["Guide"] != ""].copy()
-        return df
-
-    def update_guide_review_only_keep_team_tour(self, wb, matched_df):
-        if "Guide" not in wb.sheetnames:
-            return False
-
-        ws = wb["Guide"]
-
-        review_count_map = {}
-        for _, r in matched_df.iterrows():
-            area = str(r.get("Area", "")).strip()
-            raw_guide = r.get("Guide", "")
-            for g in self._split_guide_names(raw_guide):
-                key = (area, g)
-                review_count_map[key] = review_count_map.get(key, 0) + 1
-
-        max_col = ws.max_column
-        ok_any = False
-
-        col = 1
-        while col <= max_col:
-            area_name = ws.cell(row=1, column=col).value
-            header = ws.cell(row=2, column=col).value
-
-            if area_name and str(header).strip() == "Guide Name":
-                area = str(area_name).strip()
-                r = 3
-                while True:
-                    guide_cell = ws.cell(row=r, column=col)
-                    guide_name = guide_cell.value
-                    if guide_name is None or str(guide_name).strip() == "":
-                        break
-
-                    guide = str(guide_name).strip()
-
-                    team_count_cell = ws.cell(row=r, column=col + 3)
-                    review_count_cell = ws.cell(row=r, column=col + 1)
-                    review_pct_cell = ws.cell(row=r, column=col + 4)
-
-                    team_count = team_count_cell.value
-                    try:
-                        team_count_num = float(team_count) if team_count is not None else 0.0
-                    except:
-                        team_count_num = 0.0
-
-                    new_review_count = int(review_count_map.get((area, guide), 0))
-                    review_count_cell.value = new_review_count
-
-                    if team_count_num > 0:
-                        review_pct_cell.value = new_review_count / team_count_num
-                    else:
-                        review_pct_cell.value = 0
-
-                    review_pct_cell.number_format = '0.00%'
-
-                    ok_any = True
-                    r += 1
-
-                col += 6
-                continue
-
-            col += 1
-
-        return ok_any
-
-    def create_guide_sheet_original_style_openpyxl(self, wb, matched_df, reservation_period_df, areas_to_make):
-        if "Guide" in wb.sheetnames:
-            del wb["Guide"]
-        wb.create_sheet("Guide")
-        ws = wb["Guide"]
-
-        start_col = 1
-        for area in areas_to_make:
-            area_reviews = matched_df[matched_df['Area'] == area]
-            area_res = reservation_period_df[reservation_period_df['Area'] == area]
-            if area_res.empty:
-                continue
-
-            c = ws.cell(row=1, column=start_col, value=area)
-            c.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-            c.font = Font(bold=True, color="FFFFFF", size=12)
-
-            headers = ["Guide Name", "Review Count", "Tour Count", "Team Count", "Review %"]
-            for i, h in enumerate(headers):
-                cc = ws.cell(row=2, column=start_col + i, value=h)
-                cc.font = Font(bold=True)
-                cc.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
-
-            all_guide_names = set()
-            for raw in area_res['Main Guide'].dropna():
-                for name in self._split_guide_names(raw):
-                    all_guide_names.add(name)
-
-            stats = []
-            for guide in all_guide_names:
-                review_count = area_reviews['Guide'].apply(
-                    lambda val: guide in self._split_guide_names(val)
-                ).sum()
-
-                mask = area_res['Main Guide'].apply(
-                    lambda val: guide in self._split_guide_names(val)
-                )
-                g_res = area_res[mask]
-
-                team_count = len(g_res)
-                tour_count = g_res['Date'].nunique()
-                review_pct = (review_count / team_count) if team_count > 0 else 0
-
-                stats.append({
-                    "guide": guide,
-                    "review_count": int(review_count),
-                    "tour_count": int(tour_count),
-                    "team_count": int(team_count),
-                    "review_pct": review_pct
-                })
-
-            stats.sort(key=lambda x: (x["review_count"], x["team_count"]), reverse=True)
-
-            r = 3
-            for s in stats:
-                ws.cell(row=r, column=start_col, value=s["guide"])
-                ws.cell(row=r, column=start_col + 1, value=s["review_count"])
-                ws.cell(row=r, column=start_col + 2, value=s["tour_count"])
-                ws.cell(row=r, column=start_col + 3, value=s["team_count"])
-
-                pct_cell = ws.cell(row=r, column=start_col + 4, value=s["review_pct"])
-                pct_cell.number_format = '0.00%'
-                r += 1
-
-            for col_idx in range(start_col, start_col + 5):
-                ws.column_dimensions[get_column_letter(col_idx)].width = 15
-
-            start_col += 6
-
-    # -------------------------
-    # Exit
-    # -------------------------
-    def quit_app(self):
-        if self.driver:
+        def _srank(s):
             try:
-                self.driver.quit()
-            except:
-                pass
-        self.root.quit()
-        self.root.destroy()
+                return {5: 0, 4: 1}.get(int(float(s)), 9)
+            except (ValueError, TypeError):
+                return 9
+
+        ordered = sorted(set(areas), key=area_rank)
+        for area in ordered:
+            ws = wb.create_sheet(self._safe_name(area))   # 영어 지사명 (Seoul/Busan...)
+            for ci, h in enumerate(cols, 1):
+                c = ws.cell(row=1, column=ci, value=h)
+                c.font = Font(bold=True)
+                c.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
+            adf = matched_df[matched_df["Area"] == area].copy() if not matched_df.empty else None
+            if adf is not None and not adf.empty:
+                # 지사 시트는 좋은 리뷰(4~5점)만
+                adf = adf[adf["Star"].apply(lambda s: str(s).strip() in ("4", "5"))].copy()
+            if adf is not None and not adf.empty:
+                adf["__a"] = adf["Agency"].apply(_arank)
+                adf["__s"] = adf["Star"].apply(_srank)
+                adf = adf.sort_values(by=["Tour Date", "__a", "__s", "Agency Code"]).drop(columns=["__a", "__s"])
+                r = 2
+                for _, row in adf.iterrows():
+                    for ci, h in enumerate(cols, 1):
+                        ws.cell(row=r, column=ci, value=row.get(h, ""))
+                    r += 1
+            self._autofit_simple(ws)
+            for _ci in range(1, len(cols) + 1):
+                ws.cell(row=1, column=_ci).alignment = _center
+
+        self._build_guide_sheet_simple(wb, matched_df, res_df, ordered)
+        wb.save(path)
+        return path
+
+    def _build_guide_sheet_simple(self, wb, matched_df, res_df, ordered):
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+        ws = wb.create_sheet("Guide")
+        center = Alignment(horizontal="center", vertical="center")
+
+        def _split(v):
+            if v is None:
+                return []
+            return [n.strip() for n in str(v).split(",") if n.strip()]
+
+        def _isgood(sv):
+            return str(sv).strip() in ("4", "5")
+
+        headers = ["Guide Name", "Good", "Bad", "Total Review", "Tour Count",
+                   "Team Count", "Good %", "Bad %", "Total %"]
+        BW = len(headers)   # 8열
+        start_col = 1
+        for area in ordered:
+            area_res = res_df[res_df["Area"] == area]
+            if area_res.empty:
+                continue
+            area_rev = matched_df[matched_df["Area"] == area] if not matched_df.empty else matched_df
+            c = ws.cell(row=1, column=start_col, value=area)
+            c.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            c.font = Font(bold=True, color="FFFFFF", size=12)
+            c.alignment = center
+            for i, h in enumerate(headers):
+                cc = ws.cell(row=2, column=start_col + i, value=h)
+                cc.font = Font(bold=True)
+                cc.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
+                cc.alignment = center
+            names = set()
+            for raw in area_res["Main Guide"].dropna():
+                for n in _split(raw):
+                    names.add(n)
+            stats = []
+            for g in names:
+                if area_rev is not None and not area_rev.empty:
+                    grev = area_rev[area_rev["Guide"].apply(lambda v: g in _split(v))]
+                    good = int(grev["Star"].apply(_isgood).sum())
+                    total_rev = int(len(grev))
+                else:
+                    good = 0
+                    total_rev = 0
+                bad = total_rev - good
+                mask = area_res["Main Guide"].apply(lambda v: g in _split(v))
+                gr = area_res[mask]
+                team = len(gr)
+                tour = gr["Date"].dt.normalize().nunique()
+                gp = (good / team) if team > 0 else 0
+                bp = (bad / team) if team > 0 else 0
+                tp = (total_rev / team) if team > 0 else 0
+                stats.append((g, good, bad, int(tour), int(team), gp, bp, tp))
+            stats.sort(key=lambda x: (x[1], x[4]), reverse=True)
+            r = 3
+            for g, good, bad, tour, team, gp, bp, tp in stats:
+                ws.cell(row=r, column=start_col, value=g)
+                ws.cell(row=r, column=start_col + 1, value=good)
+                ws.cell(row=r, column=start_col + 2, value=bad)
+                ws.cell(row=r, column=start_col + 3, value=good + bad)   # Total Review = Good + Bad
+                ws.cell(row=r, column=start_col + 4, value=tour)
+                ws.cell(row=r, column=start_col + 5, value=team)
+                for jj, val in [(6, gp), (7, bp), (8, tp)]:
+                    pcell = ws.cell(row=r, column=start_col + jj, value=val)
+                    pcell.number_format = '0.00%'
+                r += 1
+            for ci in range(start_col, start_col + BW):
+                ws.column_dimensions[get_column_letter(ci)].width = 12
+            start_col += BW + 1
+
+    def quit_app(self):
+        self._clear_preload()
+        # 디버그 크롬 자체는 종료하지 않음 (사용자 세션 보존)
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
@@ -2597,18 +2316,21 @@ class ReviewCollectorNew:
 
 
 if __name__ == "__main__":
-    print("=" * 80)
-    print("리뷰 자동 수집기 시작 (3가지 모드)")
-    print("=" * 80)
-    print("\n⚠️ 먼저 크롬을 디버그 모드로 실행하세요:")
+    print("=" * 64)
+    print("Smart Review Crawling (v2) 시작")
+    print("=" * 64)
+    print("\n⚠️  먼저 크롬을 디버그 모드로 실행하세요:")
     print("\nWindows:")
-    print('  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=9222')
-    print("\n그 다음:")
-    print("  1. KLOOK 로그인: https://merchant.klook.com/reviews")
-    print("  2. KKDAY 로그인: https://scm.kkday.com/v1/en/comment/index")
-    print("  3. GG 로그인: https://supplier.getyourguide.com/performance/reviews")
-    print("=" * 80)
-    print()
-
-    app = ReviewCollectorNew()
-    app.run()
+    print('  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
+          '--remote-debugging-port=9222 --user-data-dir="C:\\Chrome_debug"')
+    print("\nMac:")
+    print('  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome '
+          '--remote-debugging-port=9222')
+    print("\n그 다음 아래 5개에 로그인:")
+    print("  L  (Klook):  https://merchant.klook.com/reviews")
+    print("  KK (KKday):  https://scm.kkday.com/v1/en/comment/index")
+    print("  GG (GYG):    https://supplier.getyourguide.com/performance/reviews")
+    print("  TPC(Trip):   https://vbooking.ctrip.com/tour/comment_manage/comment/list?bizScene=ACTIVITY")
+    print("  MRT:         https://partner.myrealtrip.com/reviews/touractivity")
+    print("=" * 64)
+    PowerReviewApp().run()
