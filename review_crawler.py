@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Smart Review Crawling  (v2)
+Smart Review Crawling
 ================================================================
 기존 'Review Search'의 후속 버전.
 
@@ -95,6 +95,24 @@ AREA_KR = {
 
 # 스페셜 카테고리 상품(리뷰 조회 대상 아님 → 결과/엑셀에서 제외). 공백제거·소문자 부분일치.
 SPECIAL_PRODUCT_KEYS = ["mbc스튜디오", "dr.petit", "마리엠헤어"]
+
+# 국가 영문명 (Monthly/Q/NYP 파일명용)
+COUNTRY_EN = {"한국": "Korea", "일본": "Japan", "호주": "Australia", "영국": "UK", "기타": "Etc"}
+
+
+def _region_tag(areas, english=False):
+    """선택 지역들의 국가명을 순서대로 이어 붙임 (파일명용)."""
+    order = [c for c, _ in COUNTRY_GROUPS]
+    cs = []
+    for a in areas:
+        c = area_country(a)
+        name = COUNTRY_EN.get(c, c) if english else c
+        if name not in cs:
+            cs.append(name)
+    cs.sort(key=lambda n: order.index(n) if (not english and n in order) else
+            ([COUNTRY_EN.get(k, k) for k in order].index(n) if english and n in [COUNTRY_EN.get(k, k) for k in order] else 99))
+    return "_".join(cs)
+
 
 
 def area_rank(area):
@@ -1592,7 +1610,8 @@ class PowerReviewApp:
 
             # 종합 (루트) : 종합 시트 + 지사별 탭 (가이드 탭 없음)
             comp = out.sort_values(by=["__c", "__a", "Main Guide", "Date"])
-            jpath = os.path.join(root, "종합.xlsx")
+            _rg = _region_tag(out["Area"].unique())
+            jpath = os.path.join(root, f"종합_{_rg}.xlsx" if _rg else "종합.xlsx")
             used_j = {"종합"}
 
             def _uqj(nm):
@@ -2186,7 +2205,8 @@ class PowerReviewApp:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill
         tag = dfrom.replace("-", "") + "-" + dto.replace("-", "")
-        fname = f"{mode_name} Review Crawling {tag}.xlsx"
+        _rg = _region_tag(areas, english=True)
+        fname = f"{mode_name} Review Crawling {_rg} {tag}.xlsx" if _rg else f"{mode_name} Review Crawling {tag}.xlsx"
         path = os.path.join(SCRIPT_DIR, fname)
         from openpyxl.styles import Alignment
         _center = Alignment(horizontal="center", vertical="center")
@@ -2317,7 +2337,7 @@ class PowerReviewApp:
 
 if __name__ == "__main__":
     print("=" * 64)
-    print("Smart Review Crawling (v2) 시작")
+    print("Smart Review Crawling 시작")
     print("=" * 64)
     print("\n⚠️  먼저 크롬을 디버그 모드로 실행하세요:")
     print("\nWindows:")
