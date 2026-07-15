@@ -78,6 +78,11 @@ try:
 except NameError:
     SCRIPT_DIR = os.getcwd()
 
+# 결과 저장 위치 = 내 컴퓨터 다운로드 폴더 (없으면 스크립트 폴더로 폴백)
+DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+if not os.path.isdir(DOWNLOAD_DIR):
+    DOWNLOAD_DIR = SCRIPT_DIR
+
 # 지사(Area)의 국가 그룹 & 표시 순서
 COUNTRY_GROUPS = [
     ("한국", ["Seoul", "Busan"]),
@@ -256,7 +261,7 @@ class PowerReviewApp:
         self.date_container.pack(fill="x", padx=20, pady=4)
 
         # (A) PFP용: 날짜 체크박스
-        self.date_cb_section, d_top, self.date_frame = _scroll_section(self.date_container, "3️⃣ 날짜", 175)
+        self.date_cb_section, d_top, self.date_frame = _scroll_section(self.date_container, "3️⃣ 날짜", 165)
         Checkbutton(d_top, text="전체", variable=self.select_all_dates,
                     command=self.toggle_all_dates).pack(side="right")
 
@@ -313,7 +318,7 @@ class PowerReviewApp:
         rsf.pack(fill="both", expand=True)
         rsb = Scrollbar(rsf)
         rsb.pack(side="right", fill="y")
-        self.result_text = Text(rsf, height=18, width=70, yscrollcommand=rsb.set,
+        self.result_text = Text(rsf, height=13, width=70, yscrollcommand=rsb.set,
                                 font=("Consolas", 9), wrap="none")
         self.result_text.pack(side="left", fill="both", expand=True)
         rsb.config(command=self.result_text.yview)
@@ -1582,7 +1587,7 @@ class PowerReviewApp:
 
     def save_excel(self, df, ask=False):
         try:
-            base_dir = SCRIPT_DIR
+            base_dir = DOWNLOAD_DIR
             if ask:
                 d = filedialog.askdirectory(title="저장 폴더 선택", initialdir=base_dir)
                 if d:
@@ -2207,7 +2212,7 @@ class PowerReviewApp:
         tag = dfrom.replace("-", "") + "-" + dto.replace("-", "")
         _rg = _region_tag(areas, english=True)
         fname = f"{mode_name} Review Crawling {_rg} {tag}.xlsx" if _rg else f"{mode_name} Review Crawling {tag}.xlsx"
-        path = os.path.join(SCRIPT_DIR, fname)
+        path = os.path.join(DOWNLOAD_DIR, fname)
         from openpyxl.styles import Alignment
         _center = Alignment(horizontal="center", vertical="center")
         wb = Workbook(); wb.remove(wb.active)
