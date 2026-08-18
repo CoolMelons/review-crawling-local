@@ -157,6 +157,44 @@ def norm_code(x):
     return re.sub(r"\s+", "", s).upper()
 
 
+def canonicalize_guides(df, col="Main Guide"):
+    """같은 사람인데 대소문자/공백만 다른 가이드 표기를 하나로 통일.
+    표시 이름은 (1)대소문자 섞인 표기 우선 (2)많이 쓰인 표기 순. 전부 대문자면 그대로 둔다."""
+    def _split(v):
+        return [n.strip() for n in str(v).split(",") if n.strip()]
+
+    def _key(n):
+        return re.sub(r"\s+", " ", str(n).strip()).lower()
+
+    variants = {}
+    for raw in df[col].dropna():
+        for n in _split(raw):
+            k = _key(n)
+            variants.setdefault(k, {})
+            variants[k][n] = variants[k].get(n, 0) + 1
+
+    disp = {}
+    for k, cands in variants.items():
+        def _low(x):
+            return sum(1 for ch in x if ch.islower())
+        best = sorted(cands.items(), key=lambda kv: (-_low(kv[0]), -kv[1], kv[0]))[0][0]
+        disp[k] = re.sub(r"\s+", " ", str(best).strip())
+
+    def _fix(v):
+        if pd.isna(v):
+            return v
+        names = [disp.get(_key(n), re.sub(r"\s+", " ", n.strip())) for n in _split(v)]
+        seen, out = set(), []
+        for n in names:                      # 중복 제거(같은 사람 두 번 적힌 경우)
+            if n not in seen:
+                seen.add(n); out.append(n)
+        return ", ".join(out)
+
+    merged = sum(1 for k, c in variants.items() if len(c) > 1)
+    df[col] = df[col].apply(_fix)
+    return df, merged
+
+
 def to_epoch_ms(dt):
     return int(pd.Timestamp(dt).timestamp() * 1000)
 
@@ -463,6 +501,9 @@ class PowerReviewApp:
             df["Agency Code"] = df["Agency Code"].astype(str).str.strip()
             df["People"] = pd.to_numeric(df["People"], errors="coerce").fillna(0).astype(int)
 
+            # 가이드 이름 표기 통일 (대소문자/공백만 다른 동일인 병합)
+            df, _merged_guides = canonicalize_guides(df)
+
             # 스페셜 카테고리 마스크 (MBC 스튜디오/Dr.Petit/마리엠헤어)
             _pn = df["Product"].astype(str).str.replace(r"\s+", "", regex=True).str.lower()
             special_mask = _pn.apply(lambda x: any(k in x for k in SPECIAL_PRODUCT_KEYS))
@@ -487,6 +528,8 @@ class PowerReviewApp:
 
             branches = sorted(df["Area"].unique().tolist())
             ns_msg = ""
+            if _merged_guides:
+                ns_msg += f" | 가이드 표기 통일 {_merged_guides}명"
             if self.noshow_teams:
                 ns_msg = f" | No Show(O) {self.noshow_teams}팀 {self.noshow_people}명 (PFP만 제외 · Monthly/NYP는 포함)"
             self.file_status.set(
@@ -2107,12 +2150,14 @@ class PowerReviewApp:
 
         # Monthly/NYP: No Show 포함 · 스페셜 제외 · 전체 가이드 · 기간 범위
         # 팀/투어 분모는 리뷰 수집 가능한 5개 채널 예약만 (L/KK/GG/TPC/MRT)
-        res_df = self.df_simple[
+        _base = self.df_simple[
             (self.df_simple["Date"].dt.normalize() >= report_min)
             & (self.df_simple["Date"].dt.normalize() <= report_max)
             & (self.df_simple["Area"].isin(sel_branches))
-            & (self.df_simple["Agency"].isin(CHANNELS))
         ].copy()
+        # Team Count(리뷰율 분모) = 5채널 예약만 / Tour Count(실제 근무일) = 전체 채널
+        res_all = _base
+        res_df = _base[_base["Agency"].isin(CHANNELS)].copy()
         if res_df.empty:
             messagebox.showerror("오류", "선택 조건에 해당하는 예약이 없습니다."); return
 
@@ -2168,7 +2213,7 @@ class PowerReviewApp:
                 })
             matched_df = pd.DataFrame(rows)
 
-            saved = self.save_excel_simple(matched_df, res_df, sel_branches, mode_name, dfrom, dto)
+            saved = self.save_excel_simple(matched_df, res_df, sel_branches, mode_name, dfrom, dto, res_all)
 
             self.log("\n" + "=" * 70)
             self.log(f"✅ {mode_name} 완료 · 매칭 {len(matched_df)}건")
@@ -2206,7 +2251,7 @@ class PowerReviewApp:
                         m = w
                 ws.column_dimensions[letter].width = min(max(m + 2, 8), 40)
 
-    def save_excel_simple(self, matched_df, res_df, areas, mode_name, dfrom, dto):
+    def save_excel_simple(self, matched_df, res_df, areas, mode_name, dfrom, dto, res_all=None):
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill
         tag = dfrom.replace("-", "") + "-" + dto.replace("-", "")
@@ -2251,11 +2296,11 @@ class PowerReviewApp:
             for _ci in range(1, len(cols) + 1):
                 ws.cell(row=1, column=_ci).alignment = _center
 
-        self._build_guide_sheet_simple(wb, matched_df, res_df, ordered)
+        self._build_guide_sheet_simple(wb, matched_df, res_df, ordered, res_all)
         wb.save(path)
         return path
 
-    def _build_guide_sheet_simple(self, wb, matched_df, res_df, ordered):
+    def _build_guide_sheet_simple(self, wb, matched_df, res_df, ordered, res_all=None):
         from openpyxl.styles import Font, PatternFill, Alignment
         from openpyxl.utils import get_column_letter
         ws = wb.create_sheet("Guide")
@@ -2272,9 +2317,12 @@ class PowerReviewApp:
         headers = ["Guide Name", "Good", "Bad", "Total Review", "Tour Count",
                    "Team Count", "Good %", "Bad %", "Total %"]
         BW = len(headers)   # 8열
+        if res_all is None:
+            res_all = res_df
         start_col = 1
         for area in ordered:
-            area_res = res_df[res_df["Area"] == area]
+            area_res = res_df[res_df["Area"] == area]          # Team(분모) = 5채널
+            area_all = res_all[res_all["Area"] == area]        # Tour(근무일) = 전체 채널
             if area_res.empty:
                 continue
             area_rev = matched_df[matched_df["Area"] == area] if not matched_df.empty else matched_df
@@ -2287,24 +2335,51 @@ class PowerReviewApp:
                 cc.font = Font(bold=True)
                 cc.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
                 cc.alignment = center
+            # 가이드 이름 정규화(대소문자·공백 무시) → 같은 사람 합치기
+            def _key(n):
+                return re.sub(r"\s+", " ", str(n).strip()).lower()
+
+            def _keys(v):
+                return [_key(n) for n in _split(v)]
+
+            # 표기 후보 수집 (5채널 + 전체 채널 모두에서)
+            variants = {}
+            for raw in list(area_res["Main Guide"].dropna()) + list(area_all["Main Guide"].dropna()):
+                for n in _split(raw):
+                    variants.setdefault(_key(n), {})
+                    variants[_key(n)][n] = variants[_key(n)].get(n, 0) + 1
+
+            def _display(k):
+                cands = variants.get(k, {})
+                if not cands:
+                    return k
+                # 대문자만인 표기보다 대소문자 섞인 표기 우선 → 그다음 많이 쓰인 순
+                def _low(x):
+                    return sum(1 for ch in x if ch.islower())
+                best = sorted(cands.items(), key=lambda kv: (-_low(kv[0]), -kv[1], kv[0]))[0][0]
+                return re.sub(r"\s+", " ", str(best).strip())   # 표시용 공백 정리
+
+            # 대상 가이드 = 5채널 예약이 있는 사람 (분모 0 방지)
             names = set()
             for raw in area_res["Main Guide"].dropna():
                 for n in _split(raw):
-                    names.add(n)
+                    names.add(_key(n))
+
             stats = []
-            for g in names:
+            for k in names:
+                g = _display(k)
                 if area_rev is not None and not area_rev.empty:
-                    grev = area_rev[area_rev["Guide"].apply(lambda v: g in _split(v))]
+                    grev = area_rev[area_rev["Guide"].apply(lambda v, k=k: k in _keys(v))]
                     good = int(grev["Star"].apply(_isgood).sum())
                     total_rev = int(len(grev))
                 else:
                     good = 0
                     total_rev = 0
                 bad = total_rev - good
-                mask = area_res["Main Guide"].apply(lambda v: g in _split(v))
-                gr = area_res[mask]
-                team = len(gr)
-                tour = gr["Date"].dt.normalize().nunique()
+                gr = area_res[area_res["Main Guide"].apply(lambda v, k=k: k in _keys(v))]
+                team = len(gr)   # 5채널 예약 수 (리뷰율 분모)
+                ga = area_all[area_all["Main Guide"].apply(lambda v, k=k: k in _keys(v))]
+                tour = ga["Date"].dt.normalize().nunique()   # 전체 채널 기준 실제 근무일
                 gp = (good / team) if team > 0 else 0
                 bp = (bad / team) if team > 0 else 0
                 tp = (total_rev / team) if team > 0 else 0
