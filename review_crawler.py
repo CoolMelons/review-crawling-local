@@ -149,10 +149,10 @@ def norm_code(x):
     m = re.match(r"^(\d+)\.0$", s)
     if m:
         s = m.group(1)
-    elif re.match(r"^\d+(\.\d+)?e[+-]?\d+$", s, flags=re.IGNORECASE):
+    elif re.match(r"^\d+(\.\d+)?e\+?\d{1,2}$", s, flags=re.IGNORECASE):
         try:
             s = format(Decimal(s), "f").split(".")[0]
-        except (InvalidOperation, ValueError):
+        except (InvalidOperation, ValueError, MemoryError, OverflowError):
             pass
     return re.sub(r"\s+", "", s).upper()
 
