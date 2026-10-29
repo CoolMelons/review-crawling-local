@@ -967,9 +967,9 @@ class PowerReviewApp:
           u.searchParams.set('pageSize', String(size));
           url=u.toString();
         }else{
-          var body={};
-          try{ body=cap.body ? JSON.parse(cap.body) : {}; }catch(e){ body={}; }
-          body.page=page; body.pageSize=size;
+          // 캡처된 본문엔 화면 필터(탭/상품/개수 조회용)가 섞일 수 있어 쓰지 않음.
+          // 검증된 최소 본문 {page, pageSize} 만 전송 (전체 리뷰 대상)
+          var body={page:page, pageSize:size};
           if(!hget('content-type')){ hdr['Content-Type']='application/json'; }
           opt.body=JSON.stringify(body);
         }
@@ -1022,6 +1022,7 @@ class PowerReviewApp:
 
         if cap:
             self.log(f"  ✓ [MRT] 요청 캡처: {cap.get('method')} {cap.get('url')}")
+            self.log(f"    (캡처 본문: {str(cap.get('body'))[:150]} → 재요청은 page/pageSize 만 사용)")
         else:
             self.log("  ⚠ [MRT] 요청 캡처 실패 → 기본 엔드포인트로 시도")
             cap = {"url": self.MRT_DEFAULT_URL, "method": "POST", "headers": {}, "body": None}
@@ -1039,6 +1040,8 @@ class PowerReviewApp:
                 break
             rows = r.get("rows") or []
             if not rows:
+                if page == 1:
+                    self.log(f"  ⚠ [MRT] 1페이지 0건 (응답 total={r.get('total')}) → 로그인 계정/권한 확인")
                 break
             oldest_ok = True
             for x in rows:
@@ -2167,6 +2170,8 @@ class PowerReviewApp:
                 self.log(f"  ⚠ [MRT] p{page} 오류: {r.get('error') if r else 'no-resp'}"); break
             rows = r.get("rows") or []
             if not rows:
+                if page == 1:
+                    self.log(f"  ⚠ [MRT] 1페이지 0건 (응답 total={r.get('total')}) → 로그인 계정/권한 확인")
                 break
             for x in rows:
                 basis = (x.get("rdate") or "")[:10] if rev else (x.get("tdate") or "")[:10]
