@@ -937,27 +937,103 @@ class PowerReviewApp:
             self.log(f"  · [TPC] 익명 리뷰(주문번호 없음) {len(anon_ratings)}건 (매칭 제외, 전체품질엔 포함)")
         return reviews, anon_ratings
 
-    def collect_mrt(self, min_ms, date_set=None):
-        reviews = {}
-        # 페이지 이동으로 세션 토큰 확보
-        self.driver.get(CHANNEL_META["MRT"]["page"])
-        time.sleep(3)
-        js = """
-        var page=P[0], size=P[1];
-        var tok=localStorage.getItem('accessToken');
-        var res=await fetch('https://api3-backoffice.myrealtrip.com/review/partner/reviews/search',
-            {method:'POST', credentials:'include',
-             headers:{'Content-Type':'application/json','partner-access-token':tok},
-             body:JSON.stringify({page:page, pageSize:size})});
-        var j=await res.json();
-        var list=Array.isArray(j.data)?j.data:[];
-        done({rows:list.map(function(x){return {code:x.reservationNo, rating:x.score,
+    # ---------------------------------------------------------
+    # MRT 공통: 실제 요청 캡처 + 진단 메시지가 있는 재요청 JS
+    # ---------------------------------------------------------
+    MRT_DEFAULT_URL = "https://api3-s.myrealtrip.com/review/partner/reviews/search"
+
+    MRT_FETCH_JS = """
+        var cap=P[0], page=P[1], size=P[2];
+        var method=(cap.method||'POST').toUpperCase();
+        var hdr={};
+        var ch=cap.headers||{};
+        for(var k in ch){ hdr[k]=ch[k]; }
+        function hget(name){ for(var k in hdr){ if(k.toLowerCase()===name) return hdr[k]; } return null; }
+        // 토큰: 캡처된 헤더 → localStorage('accessToken') → localStorage 의 *token* 키 순서
+        if(!hget('partner-access-token')){
+          var tok=null;
+          try{ tok=localStorage.getItem('accessToken'); }catch(e){}
+          if(!tok){
+            try{ for(var i=0;i<localStorage.length;i++){ var key=localStorage.key(i);
+                   if(/token/i.test(key)){ tok=localStorage.getItem(key); break; } } }catch(e){}
+          }
+          if(tok){ hdr['partner-access-token']=tok; }
+        }
+        var tokState=hget('partner-access-token') ? '있음' : '없음';
+        var url=cap.url, opt={method:method, credentials:'include', headers:hdr};
+        if(method==='GET'){
+          var u=new URL(url, location.origin);
+          u.searchParams.set('page', String(page));
+          u.searchParams.set('pageSize', String(size));
+          url=u.toString();
+        }else{
+          var body={};
+          try{ body=cap.body ? JSON.parse(cap.body) : {}; }catch(e){ body={}; }
+          body.page=page; body.pageSize=size;
+          if(!hget('content-type')){ hdr['Content-Type']='application/json'; }
+          opt.body=JSON.stringify(body);
+        }
+        var res;
+        try{ res=await fetch(url, opt); }
+        catch(e){
+          done({error:'네트워크/CORS 차단 ('+String(e)+') · url='+url+' · 토큰='+tokState+' · 현재탭='+location.href});
+          return;
+        }
+        if(!res.ok){
+          var t=''; try{ t=(await res.text()).slice(0,200); }catch(e){}
+          done({error:'HTTP '+res.status+' · 토큰='+tokState+' · '+t});
+          return;
+        }
+        var j; try{ j=await res.json(); }catch(e){ done({error:'JSON 파싱 실패: '+String(e)}); return; }
+        var list=null;
+        if(Array.isArray(j.data)) list=j.data;
+        else if(j.data && Array.isArray(j.data.content)) list=j.data.content;
+        else if(j.data && Array.isArray(j.data.list)) list=j.data.list;
+        if(list===null){ done({error:'응답 구조 변경: keys='+Object.keys(j||{}).join(',')}); return; }
+        done({rows:list.map(function(x){return {code:x.reservationNo, rating:x.score, content:x.comment||'',
               rdate:x.createdAt, tdate:x.travelStartDate};}),
               total:(j.meta&&j.meta.totalCount)||null});
-        """
+    """
+
+    def _mrt_prepare(self):
+        """MRT 리뷰 페이지가 실제로 보내는 요청을 캡처(다른 채널과 동일 방식).
+        캡처 실패 시 기본 엔드포인트로 폴백. 항상 MRT 탭 위에서 끝나도록 보장."""
+        meta = CHANNEL_META["MRT"]
+        cap = None
+        try:
+            cap = self.capture_request(meta["page"], meta["endpoint"], wait=12)
+        except Exception as e:
+            self.log(f"  ⚠ [MRT] 요청 캡처 중 오류: {e}")
+        finally:
+            self._clear_preload()
+
+        cur = ""
+        try:
+            cur = self.driver.current_url or ""
+        except Exception:
+            pass
+        if "myrealtrip.com" not in cur:
+            # 캡처 단계에서 페이지 이동이 실패했으면 다시 MRT 로 이동 (CORS 방지)
+            self.driver.get(meta["page"])
+            time.sleep(3)
+            cur = self.driver.current_url or ""
+        if re.search(r"login|signin|auth", cur, flags=re.IGNORECASE):
+            self.log(f"  ⚠ [MRT] 로그인 페이지로 이동됨 → 디버그 크롬에서 MRT 파트너센터 재로그인 필요 ({cur})")
+
+        if cap:
+            self.log(f"  ✓ [MRT] 요청 캡처: {cap.get('method')} {cap.get('url')}")
+        else:
+            self.log("  ⚠ [MRT] 요청 캡처 실패 → 기본 엔드포인트로 시도")
+            cap = {"url": self.MRT_DEFAULT_URL, "method": "POST", "headers": {}, "body": None}
+        return cap
+
+    def collect_mrt(self, min_ms, date_set=None):
+        reviews = {}
+        cap = self._mrt_prepare()
+        js = self.MRT_FETCH_JS
         page, size = 1, 50
         while page <= 200:
-            r = self._fetch_page(js, page, size)
+            r = self._fetch_page(js, cap, page, size)
             if not r or r.get("error"):
                 self.log(f"  ⚠ [MRT] p{page} 오류: {r.get('error') if r else 'no-resp'}")
                 break
@@ -2081,24 +2157,12 @@ class PowerReviewApp:
     def collect_mrt_simple(self, dfrom, dto, date_mode):
         """MRT: 전체 페이지네이션 + 클라 필터(참여=travelStartDate / 작성=createdAt) + 4~5점."""
         reviews = {}
-        self.driver.get(CHANNEL_META["MRT"]["page"])
-        time.sleep(3)
+        cap = self._mrt_prepare()
         rev = (date_mode == "review_date")
-        js = """
-        var page=P[0], size=P[1];
-        var tok=localStorage.getItem('accessToken');
-        var res=await fetch('https://api3-backoffice.myrealtrip.com/review/partner/reviews/search',
-            {method:'POST', credentials:'include',
-             headers:{'Content-Type':'application/json','partner-access-token':tok},
-             body:JSON.stringify({page:page, pageSize:size})});
-        var j=await res.json();
-        var list=Array.isArray(j.data)?j.data:[];
-        done({rows:list.map(function(x){return {code:x.reservationNo, rating:x.score, content:x.comment||'',
-              rdate:x.createdAt, tdate:x.travelStartDate};})});
-        """
+        js = self.MRT_FETCH_JS
         page, size = 1, 50
         while page <= 3000:
-            r = self._fetch_page(js, page, size)
+            r = self._fetch_page(js, cap, page, size)
             if not r or r.get("error"):
                 self.log(f"  ⚠ [MRT] p{page} 오류: {r.get('error') if r else 'no-resp'}"); break
             rows = r.get("rows") or []
